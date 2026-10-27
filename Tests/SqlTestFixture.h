@@ -70,6 +70,10 @@ inline TSessionId g_sql_test_session_id;
 // The admin session opened by initConnection(); switchToAdmin() reuses it because every
 // connect() pays for password hashing.
 inline TSessionId g_sql_admin_session_id;
+// Where initConnection() connected, for opening further connections.
+inline std::string g_sql_test_host;
+inline int g_sql_test_port{0};
+inline std::string g_sql_test_cert;
 
 // ---------------------------------------------------------------------------
 // Visitor helpers (operate on Thrift TDatum / TRowSet only)
@@ -464,6 +468,17 @@ class SqlTestFixture : public ::testing::Test {
    */
   void SetUp() override { switchToAdmin(); }
 
+  // A new, unauthenticated connection to the server initConnection() connected to. A
+  // HeavyClient is not thread-safe, so a query on another thread needs its own.
+  static std::shared_ptr<HeavyClient> newClient() {
+    auto conn_mgr = std::make_shared<ThriftClientConnection>();
+    auto transport = conn_mgr->open_buffered_client_transport(
+        g_sql_test_host, g_sql_test_port, g_sql_test_cert);
+    transport->open();
+    auto protocol = std::make_shared<TBinaryProtocol>(transport);
+    return std::make_shared<HeavyClient>(protocol);
+  }
+
   static void initConnection(int argc, char** argv) {
     std::string host = "localhost";
     int port = 6274;
@@ -488,11 +503,10 @@ class SqlTestFixture : public ::testing::Test {
               vm);
     po::notify(vm);
 
-    auto conn_mgr = std::make_shared<ThriftClientConnection>();
-    auto transport = conn_mgr->open_buffered_client_transport(host, port, cert);
-    transport->open();
-    auto protocol = std::make_shared<TBinaryProtocol>(transport);
-    g_sql_test_client = std::make_shared<HeavyClient>(protocol);
+    g_sql_test_host = host;
+    g_sql_test_port = port;
+    g_sql_test_cert = cert;
+    g_sql_test_client = newClient();
     g_sql_test_client->connect(g_sql_test_session_id, user, pwd, db);
     g_sql_admin_session_id = g_sql_test_session_id;
     // DBHandlerTestFixture ran the admin session on the CPU; a new session on a server

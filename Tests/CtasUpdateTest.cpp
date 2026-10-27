@@ -5,11 +5,13 @@
 
 #include <gtest/gtest.h>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 
-#include "DBHandlerTestHelpers.h"
-#include "LockMgr/LockMgr.h"
-#include "QueryEngine/ErrorHandling.h"
+#include <boost/filesystem.hpp>
+#include <future>
+
+#include "SqlTestFixture.h"
 #include "TestHelpers.h"
 
 // uncomment to run full test suite
@@ -18,6 +20,28 @@
 #ifndef BASE_PATH
 #define BASE_PATH "./tmp"
 #endif
+
+namespace {
+
+// The server resolves relative paths against its own working directory, not ours.
+std::string datafile_path(const std::string& file_name) {
+  return boost::filesystem::absolute("../../Tests/Import/datafiles/" + file_name)
+      .lexically_normal()
+      .string();
+}
+
+// The id of the string dictionary behind a dict-encoded text column (the catalog's
+// comp_param). get_table_details reports the dictionary's size instead, so read it from the
+// metadata of a projection.
+int32_t get_dict_id(const std::string& table_name, const std::string& column_name) {
+  TQueryResult result;
+  SqlTestFixture::sql(result, "SELECT " + column_name + " FROM " + table_name + ";");
+  const auto& type = result.row_set.row_desc.at(0).col_type;
+  EXPECT_TRUE(type.__isset.dict_key);
+  return type.dict_key.dict_id;
+}
+
+}  // namespace
 
 class TestColumnDescriptor {
  public:
@@ -699,14 +723,14 @@ class GeoPolygonColumnDescriptor : public TestColumnDescriptor {
   }
 };
 
-class Itas : public DBHandlerTestFixture {
+class Itas : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 
   void itas_syntax_check(const std::string& sql_in,
                          const std::string& create_src_ddl,
@@ -984,7 +1008,7 @@ class Itas_P : public Itas,
   Itas_P() { columnDescriptors = GetParam(); }
 };
 
-class Update : public DBHandlerTestFixture,
+class Update : public SqlTestFixture,
                public testing::WithParamInterface<
                    std::vector<std::shared_ptr<TestColumnDescriptor>>> {
  public:
@@ -992,11 +1016,11 @@ class Update : public DBHandlerTestFixture,
 
   Update() { columnDescriptors = GetParam(); }
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 
   void updateColumnByLiteralTest(
       std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
@@ -1156,7 +1180,7 @@ class Update : public DBHandlerTestFixture,
   }
 };
 
-class Ctas : public DBHandlerTestFixture,
+class Ctas : public SqlTestFixture,
              public testing::WithParamInterface<
                  std::vector<std::shared_ptr<TestColumnDescriptor>>> {
  public:
@@ -1164,11 +1188,11 @@ class Ctas : public DBHandlerTestFixture,
 
   Ctas() { columnDescriptors = GetParam(); }
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 
   void runCtasTest(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
                    std::string create_ctas_sql,
@@ -1212,14 +1236,8 @@ class Ctas : public DBHandlerTestFixture,
     sql(create_ctas_sql);
 
     // check tables
-    auto& cat = getCatalog();
-    const TableDescriptor* td_source = cat.getMetadataForTable("CTAS_SOURCE");
-    const TableDescriptor* td_target = cat.getMetadataForTable("CTAS_TARGET");
-
-    auto source_cols =
-        cat.getAllColumnMetadataForTable(td_source->tableId, false, true, false);
-    auto target_cols =
-        cat.getAllColumnMetadataForTable(td_target->tableId, false, true, false);
+    auto source_cols = getTableDetails("CTAS_SOURCE").row_desc;
+    auto target_cols = getTableDetails("CTAS_TARGET").row_desc;
 
     ASSERT_EQ(source_cols.size(), target_cols.size());
 
@@ -1227,18 +1245,12 @@ class Ctas : public DBHandlerTestFixture,
       auto source_col = source_cols.back();
       auto target_col = target_cols.back();
 
-      LOG(INFO) << "Checking: " << source_col->columnName << " vs. "
-                << target_col->columnName << " ( "
-                << source_col->columnType.get_type_name() << " vs. "
-                << target_col->columnType.get_type_name() << " )";
+      LOG(INFO) << "Checking: " << source_col.col_name << " vs. " << target_col.col_name
+                << " ( " << source_col.col_type.type << " vs. "
+                << target_col.col_type.type << " )";
 
-      //    ASSERT_EQ(source_col->columnType.get_type(),
-      //    target_col->columnType.get_type());
-      //    ASSERT_EQ(source_col->columnType.get_elem_type(),
-      //    target_col->columnType.get_elem_type());
-      ASSERT_EQ(source_col->columnType.get_compression(),
-                target_col->columnType.get_compression());
-      ASSERT_EQ(source_col->columnType.get_size(), target_col->columnType.get_size());
+      ASSERT_EQ(source_col.col_type.encoding, target_col.col_type.encoding);
+      ASSERT_EQ(source_col.col_type.size, target_col.col_type.size);
 
       source_cols.pop_back();
       target_cols.pop_back();
@@ -1348,34 +1360,14 @@ TEST_P(Ctas, SyntaxCheck) {
       "USE_SHARED_DICTIONARIES='FALSE' );";
   sql(ddl);
 
-  {
-    auto& cat = getCatalog();
-    auto td_source = cat.getMetadataForTable("CTAS_SOURCE_TEXT");
-    auto cd_source = cat.getMetadataForColumn(td_source->tableId, "id");
-
-    auto td_target = cat.getMetadataForTable("CTAS_TARGET");
-    auto cd_target = cat.getMetadataForColumn(td_target->tableId, "id");
-
-    ASSERT_TRUE(cd_source->columnType.get_comp_param() !=
-                cd_target->columnType.get_comp_param());
-  }
+  ASSERT_NE(get_dict_id("CTAS_SOURCE_TEXT", "id"), get_dict_id("CTAS_TARGET", "id"));
 
   ddl = "DROP TABLE CTAS_TARGET;";
   sql(ddl);
   ddl = "CREATE TABLE CTAS_TARGET AS SELECT * FROM CTAS_SOURCE_TEXT;";
   sql(ddl);
 
-  {
-    auto& cat = getCatalog();
-    auto td_source = cat.getMetadataForTable("CTAS_SOURCE_TEXT");
-    auto cd_source = cat.getMetadataForColumn(td_source->tableId, "id");
-
-    auto td_target = cat.getMetadataForTable("CTAS_TARGET");
-    auto cd_target = cat.getMetadataForColumn(td_target->tableId, "id");
-
-    ASSERT_EQ(cd_source->columnType.get_comp_param(),
-              cd_target->columnType.get_comp_param());
-  }
+  ASSERT_EQ(get_dict_id("CTAS_SOURCE_TEXT", "id"), get_dict_id("CTAS_TARGET", "id"));
 
   ddl = "DROP TABLE CTAS_TARGET;";
   sql(ddl);
@@ -1384,17 +1376,7 @@ TEST_P(Ctas, SyntaxCheck) {
       "USE_SHARED_DICTIONARIES='TRUE' );";
   sql(ddl);
 
-  {
-    auto& cat = getCatalog();
-    auto td_source = cat.getMetadataForTable("CTAS_SOURCE_TEXT");
-    auto cd_source = cat.getMetadataForColumn(td_source->tableId, "id");
-
-    auto td_target = cat.getMetadataForTable("CTAS_TARGET");
-    auto cd_target = cat.getMetadataForColumn(td_target->tableId, "id");
-
-    ASSERT_EQ(cd_source->columnType.get_comp_param(),
-              cd_target->columnType.get_comp_param());
-  }
+  ASSERT_EQ(get_dict_id("CTAS_SOURCE_TEXT", "id"), get_dict_id("CTAS_TARGET", "id"));
 }
 
 TEST_P(Ctas, LiteralStringTest) {
@@ -1962,14 +1944,14 @@ TEST_F(Itas, ItasOrderLimitOffset) {
   sql("DELETE FROM ITAS_TARGET;");
 }
 
-class Export : public DBHandlerTestFixture {
+class Export : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 
   void exportTestBody(std::string sourcePartitionScheme = ")") {
     sql("DROP TABLE IF EXISTS EXPORT_SOURCE;");
@@ -2526,14 +2508,14 @@ TEST_P(Itas_P, PartialInsertIntoShardedTableFromSelectSharded) {
       ", SHARD KEY (id)) WITH (shard_count = 4, partitions='SHARDED')");
 }
 
-class Select : public DBHandlerTestFixture {
+class Select : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 };
 
 TEST_F(Select, CtasItasValidation) {
@@ -2569,7 +2551,7 @@ TEST_F(Select, CtasItasValidation) {
   // because "INSERT INTO ..." stmt for this takes too much time
   // and add pre-generated dataset increases meaningless LOC of this test code
   const auto data1_path =
-      boost::filesystem::path("../../Tests/Import/datafiles/ctas_itas_validation_1.csv");
+      boost::filesystem::path(datafile_path("ctas_itas_validation_1.csv"));
   if (boost::filesystem::exists(data1_path)) {
     boost::filesystem::remove(data1_path);
   }
@@ -2582,7 +2564,7 @@ TEST_F(Select, CtasItasValidation) {
   out1.close();
 
   const auto data2_path =
-      boost::filesystem::path("../../Tests/Import/datafiles/ctas_itas_validation_2.csv");
+      boost::filesystem::path(datafile_path("ctas_itas_validation_2.csv"));
   if (boost::filesystem::exists(data2_path)) {
     boost::filesystem::remove(data2_path);
   }
@@ -2752,18 +2734,15 @@ TEST_F(Select, CtasGeoCompress4326) {
     sqlAndCompareResult("SELECT COUNT(1) FROM CTAS_GeoPoint4326 WHERE pt is null;",
                         {{i(2)}});
 
-    auto& cat = getCatalog();
-    const TableDescriptor* td = cat.getMetadataForTable("CTAS_GeoPoint4326");
-
-    auto cols = cat.getAllColumnMetadataForTable(td->tableId, false, true, false);
+    auto cols = getTableDetails("CTAS_GeoPoint4326").row_desc;
 
     ASSERT_EQ(cols.size(), (size_t)1);
 
     auto col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kPOINT);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_GEOINT);
-    ASSERT_EQ(col->columnType.get_comp_param(), 32);
+    ASSERT_EQ(col.col_type.type, TDatumType::POINT);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::GEOINT);
+    ASSERT_EQ(col.col_type.comp_param, 32);
 
     sqlAndCompareResult(
         "SELECT count(*) FROM CTAS_GeoPoint4326 "
@@ -2790,18 +2769,15 @@ TEST_F(Select, CtasGeoCompress4326) {
     sqlAndCompareResult("SELECT COUNT(1) FROM CTAS_GeoPoint4326_mc WHERE pt is null;",
                         {{i(2)}});
 
-    auto& cat = getCatalog();
-    const TableDescriptor* td = cat.getMetadataForTable("CTAS_GeoPoint4326_mc");
-
-    auto cols = cat.getAllColumnMetadataForTable(td->tableId, false, true, false);
+    auto cols = getTableDetails("CTAS_GeoPoint4326_mc").row_desc;
 
     ASSERT_EQ(cols.size(), (size_t)1);
 
     auto col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kPOINT);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_NONE);
-    ASSERT_EQ(col->columnType.get_comp_param(), 0);
+    ASSERT_EQ(col.col_type.type, TDatumType::POINT);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::NONE);
+    ASSERT_EQ(col.col_type.comp_param, 0);
 
     sqlAndCompareResult(
         "SELECT count(*) FROM CTAS_GeoPoint4326_mc "
@@ -2826,31 +2802,28 @@ TEST_F(Select, CtasGeoCompress4326) {
     sql("CREATE TABLE CTAS_GeoLines4326 AS SELECT * FROM GeoLines4326 "
         "WITH ( FORCE_GEO_COMPRESSION='true' );");
 
-    auto& cat = getCatalog();
-    const TableDescriptor* td = cat.getMetadataForTable("CTAS_GeoLines4326");
-
-    auto cols = cat.getAllColumnMetadataForTable(td->tableId, false, true, false);
+    auto cols = getTableDetails("CTAS_GeoLines4326").row_desc;
 
     ASSERT_EQ(cols.size(), (size_t)3);
 
     auto col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kMULTILINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_GEOINT);
-    ASSERT_EQ(col->columnType.get_comp_param(), 32);
+    ASSERT_EQ(col.col_type.type, TDatumType::MULTILINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::GEOINT);
+    ASSERT_EQ(col.col_type.comp_param, 32);
     cols.pop_back();
 
     col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kLINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_GEOINT);
-    ASSERT_EQ(col->columnType.get_comp_param(), 32);
+    ASSERT_EQ(col.col_type.type, TDatumType::LINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::GEOINT);
+    ASSERT_EQ(col.col_type.comp_param, 32);
     cols.pop_back();
 
     col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kLINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_NONE);
+    ASSERT_EQ(col.col_type.type, TDatumType::LINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::NONE);
     cols.pop_back();
   }
 
@@ -2858,31 +2831,28 @@ TEST_F(Select, CtasGeoCompress4326) {
     sql("CREATE TABLE CTAS_GeoLines4326_mc AS SELECT * FROM GeoLines4326 "
         "WITH ( FORCE_GEO_COMPRESSION='false' );");
 
-    auto& cat = getCatalog();
-    const TableDescriptor* td = cat.getMetadataForTable("CTAS_GeoLines4326_mc");
-
-    auto cols = cat.getAllColumnMetadataForTable(td->tableId, false, true, false);
+    auto cols = getTableDetails("CTAS_GeoLines4326_mc").row_desc;
 
     ASSERT_EQ(cols.size(), (size_t)3);
 
     auto col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kMULTILINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_GEOINT);
-    ASSERT_EQ(col->columnType.get_comp_param(), 32);
+    ASSERT_EQ(col.col_type.type, TDatumType::MULTILINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::GEOINT);
+    ASSERT_EQ(col.col_type.comp_param, 32);
     cols.pop_back();
 
     col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kLINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_NONE);
-    ASSERT_EQ(col->columnType.get_comp_param(), 0);
+    ASSERT_EQ(col.col_type.type, TDatumType::LINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::NONE);
+    ASSERT_EQ(col.col_type.comp_param, 0);
     cols.pop_back();
 
     col = cols.back();
-    ASSERT_EQ(col->columnType.get_type(), kLINESTRING);
-    ASSERT_EQ(col->columnType.get_subtype(), kGEOMETRY);
-    ASSERT_EQ(col->columnType.get_compression(), kENCODING_NONE);
+    ASSERT_EQ(col.col_type.type, TDatumType::LINESTRING);
+    ASSERT_EQ(col.col_type.precision, static_cast<int>(kGEOMETRY));
+    ASSERT_EQ(col.col_type.encoding, TEncodingType::NONE);
     cols.pop_back();
   }
 
@@ -2914,14 +2884,14 @@ TEST_F(Select, CtasFixedLenBooleanArrayCrash) {
   drop_table();
 }
 
-class Errors : public DBHandlerTestFixture {
+class Errors : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
   }
 
-  void TearDown() override { DBHandlerTestFixture::TearDown(); }
+  void TearDown() override { SqlTestFixture::TearDown(); }
 
   void create_itas_tables() {
     sql("DROP TABLE IF EXISTS test_src_a;");
@@ -2955,15 +2925,15 @@ TEST_F(Errors, CtasItas) {
   EXPECT_ANY_THROW(sql("INSERT INTO test_itas SELECT * FROM test_src_a;"));
 }
 
-class Non_Kernel_Time_Interrupt : public DBHandlerTestFixture {
+class Non_Kernel_Time_Interrupt : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     try {
       sql("DROP TABLE IF EXISTS t_very_large;");
       sql("CREATE TABLE t_very_large (x int not null, y int not null, z int not null);");
-      const auto file_path_very_large = boost::filesystem::path(
-          "../../Tests/Import/datafiles/interrupt_table_very_large.csv");
+      const auto file_path_very_large =
+          boost::filesystem::path(datafile_path("interrupt_table_very_large.csv"));
       if (boost::filesystem::exists(file_path_very_large)) {
         boost::filesystem::remove(file_path_very_large);
       }
@@ -2976,9 +2946,8 @@ class Non_Kernel_Time_Interrupt : public DBHandlerTestFixture {
       very_large_out.close();
 
       std::string import_very_large_table_str{
-          "COPY t_very_large FROM "
-          "'../../Tests/Import/datafiles/interrupt_table_very_large.csv' WITH "
-          "(header='false')"};
+          "COPY t_very_large FROM '" + file_path_very_large.string() +
+          "' WITH (header='false')"};
       sql(import_very_large_table_str);
     } catch (...) {
       LOG(ERROR) << "Failed to (re-)create table";
@@ -2987,12 +2956,31 @@ class Non_Kernel_Time_Interrupt : public DBHandlerTestFixture {
 
   void TearDown() override {
     sql("DROP TABLE IF EXISTS t_very_large;");
-    boost::filesystem::remove(
-        "../../Tests/Import/datafiles/interrupt_table_very_large.csv");
+    boost::filesystem::remove(datafile_path("interrupt_table_very_large.csv"));
 
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 };
+
+namespace {
+
+// Runs `query` in `session` on a connection of its own (a HeavyClient is not thread-safe),
+// so that the test thread can interrupt it. `on_error` gets the server's message.
+std::future<void> run_query_async(const std::string& session,
+                                  const std::string& query,
+                                  const std::function<void(const std::string&)>& on_error) {
+  return std::async(std::launch::async, [session, query, on_error] {
+    try {
+      auto client = SqlTestFixture::newClient();
+      TQueryResult result;
+      client->sql_execute(result, session, query, false, "", -1, -1);
+    } catch (const TDBException& e) {
+      on_error(e.error_msg);
+    }
+  });
+}
+
+}  // namespace
 
 TEST_F(Non_Kernel_Time_Interrupt, Interrupt_ITAS) {
   // disable interrupt test on dist mode due to catalog inconsistency issue
@@ -3001,19 +2989,16 @@ TEST_F(Non_Kernel_Time_Interrupt, Interrupt_ITAS) {
   bool detect_time_out = false;
 
   try {
-    const auto& [db_handler_ptr, db_handler_session] = getDbHandlerAndSessionId();
-    DBHandler* db_handler = db_handler_ptr;
-    std::string session_id = db_handler_session;
+    const auto& [client, client_session] = getDbHandlerAndSessionId();
+    const std::string session_id = client_session;
 
     // do ITAS
     sql("DROP TABLE IF EXISTS t_ITAS;");
     sql("CREATE TABLE t_ITAS (x int not null);");
 
-    auto check_interrup_msg = [&catchInterruption](const std::string& msg,
-                                                   bool is_pending_query) {
+    auto check_interrup_msg = [&catchInterruption](const std::string& msg) {
       std::cout << msg << std::endl;
-      std::string out_of_slot_msg{"Ran out of slots in the query output buffer"};
-      if (out_of_slot_msg.compare(msg) == 0) {
+      if (msg.find("Ran out of slots in the query output buffer") != std::string::npos) {
         return;
       }
 
@@ -3026,63 +3011,15 @@ TEST_F(Non_Kernel_Time_Interrupt, Interrupt_ITAS) {
       catchInterruption.store(true);
     };
 
-    auto itas_thread = std::async(std::launch::async, [&] {
-      try {
-        auto query = "INSERT INTO t_ITAS SELECT x FROM t_very_large";
-        ExecutionResult result;
-        lockmgr::LockedTableDescriptors locks;
-        db_handler->sql_execute(result, session_id, query, false, -1, -1, locks);
-      } catch (const QueryExecutionError& e) {
-        if (e.hasErrorCode(ErrorCode::INTERRUPTED)) {
-          catchInterruption.store(true);
-        } else if (e.getErrorCode() < 0) {
-          std::cout << "Detect out of slot issue in the query output buffer while "
-                       "performing ITAS"
-                    << std::endl;
-          return;
-        } else {
-          throw e;
-        }
-      } catch (const std::runtime_error& e) {
-        check_interrup_msg(e.what(), false);
-      } catch (...) {
-        throw;
-      }
-      return;
-    });
+    auto itas_thread = run_query_async(
+        session_id, "INSERT INTO t_ITAS SELECT x FROM t_very_large", check_interrup_msg);
 
-    std::vector<QuerySessionStatus> query_status;
-    auto start_time = std::chrono::system_clock::now();
-    bool startITAS = false;
-    auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
-    while (!startITAS && !detect_time_out) {
-      {
-        heavyai::shared_lock<heavyai::shared_mutex> session_read_lock(
-            executor->getSessionLock());
-        query_status = executor->getQuerySessionInfo(session_id, session_read_lock);
-      }
-      if (query_status.size() == 1) {
-        if (query_status[0].getQuerySession().compare(session_id) != 0) {
-          CHECK(false);
-        }
-        auto query_str = query_status[0].getQueryStr();
-        if (query_str.find("INSERT_DATA") != std::string::npos) {
-          startITAS = true;
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          db_handler->interrupt(session_id, session_id);
-          break;
-        }
-      }
-      auto end_time = std::chrono::system_clock::now();
-      auto cur_sec =
-          std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
-      if (cur_sec.count() > 60) {
-        detect_time_out = true;
-        throw std::runtime_error("Detect time_out while performing ITAS");
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!waitForQueryInStatus(session_id, "INSERT_DATA")) {
+      detect_time_out = true;
+      throw std::runtime_error("Detect time_out while performing ITAS");
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    client->interrupt(session_id, session_id);
 
     if (catchInterruption.load()) {
       std::cout << "Detect interrupt request while performing ITAS" << std::endl;
@@ -3114,15 +3051,12 @@ TEST_F(Non_Kernel_Time_Interrupt, Interrupt_CTAS) {
   bool detect_time_out = false;
 
   try {
-    const auto& [db_handler_ptr, db_handler_session] = getDbHandlerAndSessionId();
-    DBHandler* db_handler = db_handler_ptr;
-    std::string session_id = db_handler_session;
+    const auto& [client, client_session] = getDbHandlerAndSessionId();
+    const std::string session_id = client_session;
 
-    auto check_interrup_msg = [&catchInterruption](const std::string& msg,
-                                                   bool is_pending_query) {
+    auto check_interrup_msg = [&catchInterruption](const std::string& msg) {
       std::cout << msg << std::endl;
-      std::string out_of_slot_msg{"Ran out of slots in the query output buffer"};
-      if (out_of_slot_msg.compare(msg) == 0) {
+      if (msg.find("Ran out of slots in the query output buffer") != std::string::npos) {
         return;
       }
       auto check_interrupted_msg = msg.find("interrupted");
@@ -3135,61 +3069,17 @@ TEST_F(Non_Kernel_Time_Interrupt, Interrupt_CTAS) {
     };
     // do CTAS
     sql("DROP TABLE IF EXISTS t_CTAS;");
-    auto ctas_thread = std::async(std::launch::async, [&] {
-      try {
-        auto query = "CREATE TABLE t_CTAS AS SELECT * FROM t_very_large WHERE x < 3;";
-        ExecutionResult result;
-        lockmgr::LockedTableDescriptors locks;
-        db_handler->sql_execute(result, session_id, query, false, -1, -1, locks);
-      } catch (const QueryExecutionError& e) {
-        if (e.hasErrorCode(ErrorCode::INTERRUPTED)) {
-          catchInterruption.store(true);
-        } else if (e.getErrorCode() < 0) {
-          std::cout << "Detect out of slot issue in the query output buffer while "
-                       "performing CTAS"
-                    << std::endl;
-          return;
-        } else {
-          throw e;
-        }
-      } catch (const std::runtime_error& e) {
-        check_interrup_msg(e.what(), false);
-      } catch (...) {
-        throw;
-      }
-      return;
-    });
-    std::vector<QuerySessionStatus> query_status;
-    auto start_time = std::chrono::system_clock::now();
-    bool startCTAS = false;
-    auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
-    while (!startCTAS && !detect_time_out) {
-      {
-        heavyai::shared_lock<heavyai::shared_mutex> session_read_lock(
-            executor->getSessionLock());
-        query_status = executor->getQuerySessionInfo(session_id, session_read_lock);
-      }
-      if (query_status.size() == 1) {
-        if (query_status[0].getQuerySession().compare(session_id) != 0) {
-          CHECK(false);
-        }
-        auto query_str = query_status[0].getQueryStr();
-        if (query_str.find("INSERT_DATA") != std::string::npos) {
-          startCTAS = true;
-          db_handler->interrupt(session_id, session_id);
-          break;
-        }
-      }
-      auto end_time = std::chrono::system_clock::now();
-      auto cur_sec =
-          std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
-      if (cur_sec.count() > 60) {
-        detect_time_out = true;
-        throw std::runtime_error("Detect time_out while performing CTAS");
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto ctas_thread =
+        run_query_async(session_id,
+                        "CREATE TABLE t_CTAS AS SELECT * FROM t_very_large WHERE x < 3;",
+                        check_interrup_msg);
+
+    if (!waitForQueryInStatus(session_id, "INSERT_DATA")) {
+      detect_time_out = true;
+      throw std::runtime_error("Detect time_out while performing CTAS");
     }
+    client->interrupt(session_id, session_id);
+
     if (catchInterruption.load()) {
       std::cout << "Detect interrupt request while performing CTAS" << std::endl;
       // CTAS is interrupted and so the table is dropped
@@ -3204,10 +3094,10 @@ TEST_F(Non_Kernel_Time_Interrupt, Interrupt_CTAS) {
   }
 }
 
-class ItasStringTest : public DBHandlerTestFixture {
+class ItasStringTest : public SqlTestFixture {
  public:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     sql("drop table if exists lower_function_test_people;");
     sql("create table lower_function_test_people(first_name text, last_name text "
         "encoding none, age integer, country_code text);");
@@ -3229,7 +3119,7 @@ class ItasStringTest : public DBHandlerTestFixture {
   void TearDown() override {
     sql("drop table lower_function_test_people;");
     sql("drop table lower_function_test_countries;");
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   void assertExpectedResult(const std::vector<std::string> headers,
@@ -3271,9 +3161,6 @@ TEST_F(ItasStringTest, InsertIntoSelectLowercase_SameTable) {
       "select first_name, last_name, country_code from lower_function_test_people "
       "where first_name = 'Sue';";
 
-  // globals for "lower()"
-  g_enable_string_functions = true;
-
   TQueryResult select_result;
   sql(insert_sql);
   sql(select_result, select_sql);
@@ -3283,7 +3170,6 @@ TEST_F(ItasStringTest, InsertIntoSelectLowercase_SameTable) {
                        {{"Sue", "Smith", "CA"}, {"Sue", "Smith", "ca"}},
                        select_result);
 
-  g_enable_string_functions = false;
 }
 
 TEST_F(ItasStringTest, InsertIntoSelectLowercase_DifferentTables) {
@@ -3300,9 +3186,6 @@ TEST_F(ItasStringTest, InsertIntoSelectLowercase_DifferentTables) {
   std::vector<std::vector<ScalarTargetValue>> expected_result_set{
       {"united states", "Washington", "US"}};
 
-  // globals for "lower()"
-  g_enable_string_functions = true;
-
   TQueryResult select_result;
   sql(insert_sql);
   sql(select_result, select_sql);
@@ -3312,7 +3195,6 @@ TEST_F(ItasStringTest, InsertIntoSelectLowercase_DifferentTables) {
                        {{"united states", "Washington", "US"}},
                        select_result);
 
-  g_enable_string_functions = false;
 }
 
 const char* create_table_mini_sort = R"(
@@ -3330,7 +3212,7 @@ const char* create_table_mini_sort = R"(
     va int[])
   )";
 
-class CtasImportTestMiniSort : public DBHandlerTestFixture,
+class CtasImportTestMiniSort : public SqlTestFixture,
                                public testing::WithParamInterface<
                                    std::vector<std::shared_ptr<TestColumnDescriptor>>> {
  public:
@@ -3339,7 +3221,7 @@ class CtasImportTestMiniSort : public DBHandlerTestFixture,
   CtasImportTestMiniSort() { columnDescriptors = GetParam(); }
 
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
     ASSERT_NO_THROW(sql("drop table if exists sortab;"));
     ASSERT_NO_THROW(sql("drop table if exists sortctas;"));
@@ -3348,7 +3230,7 @@ class CtasImportTestMiniSort : public DBHandlerTestFixture,
   void TearDown() override {
     ASSERT_NO_THROW(sql("drop table if exists sortab;"));
     ASSERT_NO_THROW(sql("drop table if exists sortctas;"));
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   void create_minisort_table_on_column(const std::string& column_name) {
@@ -3356,8 +3238,8 @@ class CtasImportTestMiniSort : public DBHandlerTestFixture,
         sql(std::string(create_table_mini_sort) +
             (column_name.size() ? " with (sort_column='" + column_name + "');" : ";")));
     EXPECT_NO_THROW(
-        sql("copy sortab from '../../Tests/Import/datafiles/mini_sort.txt' "
-            "with (header='false');"));
+        sql("copy sortab from '" + datafile_path("mini_sort.txt") +
+            "' with (header='false');"));
   }
 
   void check_minisort_on_expects(const std::string& table_name,
@@ -3492,7 +3374,7 @@ TEST_P(CtasImportTestMiniSort, ctas_on_geo_point) {
   test_minisort_on_column_with_ctas("pt", {2, 3, 4, 5, 1});
 }
 
-class CtasTableTest : public DBHandlerTestFixture,
+class CtasTableTest : public SqlTestFixture,
                       public testing::WithParamInterface<
                           std::vector<std::shared_ptr<TestColumnDescriptor>>> {
  public:
@@ -3500,7 +3382,7 @@ class CtasTableTest : public DBHandlerTestFixture,
   const size_t g_num_rows{10};
 
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     // Default connection string outside of thrift
     ASSERT_NO_THROW(sql("drop table if exists test_table;"));
     ASSERT_NO_THROW(sql("drop table if exists ctas_test;"));
@@ -3514,7 +3396,7 @@ class CtasTableTest : public DBHandlerTestFixture,
     ASSERT_NO_THROW(sql("drop table if exists ctas_test;"));
     ASSERT_NO_THROW(sql("drop table if exists ctas_test_empty;"));
     ASSERT_NO_THROW(sql("drop table if exists ctas_test_full;"));
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   void createTestTable() {
@@ -3704,10 +3586,10 @@ Was expecting:
     "MODEL" ...)");
 }
 
-class NullTextArrayTest : public DBHandlerTestFixture {
+class NullTextArrayTest : public SqlTestFixture {
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     sql("DROP TABLE IF EXISTS null_text_arrays;");
     sql("DROP TABLE IF EXISTS null_text_arrays_2;");
   }
@@ -3715,7 +3597,7 @@ class NullTextArrayTest : public DBHandlerTestFixture {
   void TearDown() override {
     sql("DROP TABLE IF EXISTS null_text_arrays;");
     sql("DROP TABLE IF EXISTS null_text_arrays_2;");
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   void createTable(const std::string& table_name) {
@@ -3765,11 +3647,11 @@ TEST_F(NullTextArrayTest, InsertIntoTableAsSelect) {
 
 using ColumnNameAndType = std::pair<std::string, SQLTypeInfo>;
 class ItasStringConversionValidationTest
-    : public DBHandlerTestFixture,
+    : public SqlTestFixture,
       public testing::WithParamInterface<ColumnNameAndType> {
  protected:
   static void SetUpTestSuite() {
-    DBHandlerTestFixture::SetUpTestSuite();
+    SqlTestFixture::SetUpTestSuite();
     sql("DROP TABLE IF EXISTS non_text_columns;");
     sql("CREATE TABLE non_text_columns (b BOOLEAN, bint BIGINT, i INTEGER, sint "
         "SMALLINT, "
@@ -3783,12 +3665,12 @@ class ItasStringConversionValidationTest
 
   static void TearDownTestSuite() {
     sql("DROP TABLE IF EXISTS non_text_columns;");
-    DBHandlerTestFixture::TearDownTestSuite();
+    SqlTestFixture::TearDownTestSuite();
   }
 
   void TearDown() override {
     sql("DROP TABLE IF EXISTS single_text_column;");
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 };
 
@@ -3836,14 +3718,14 @@ INSTANTIATE_TEST_SUITE_P(
 int main(int argc, char* argv[]) {
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
-  DBHandlerTestFixture::initTestArgs(argc, argv);
 
   int err{0};
   try {
-    testing::AddGlobalTestEnvironment(new DBHandlerTestEnvironment);
+    SqlTestFixture::initConnection(argc, argv);
     err = RUN_ALL_TESTS();
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
+    err = 1;
   }
   return err;
 }
