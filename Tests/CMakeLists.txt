@@ -176,10 +176,16 @@ list(APPEND SANITY_TEST_PROGRAMS AlterTableDdlTest)
 
 ##########
 
-add_executable(ArrayTest ArrayTest.cpp)
-target_link_libraries(ArrayTest ${EXECUTE_TEST_LIBS})
-add_test(ArrayTest ArrayTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS ArrayTest)
+# The in-process tests ran queries with loop joins allowed (QueryRunner::runSQL). The
+# parallel-linearization tests lowered g_enable_parallel_linearization to 10 in process, so
+# they run against a server started with that threshold (the default entry excludes them);
+# the filters must stay in sync with MultiFragArrayParallelLinearizationTest in ArrayTest.cpp.
+add_thin_client_test(ArrayTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-MultiFragArrayParallelLinearizationTest.*")
+add_thin_client_test_variant(ArrayTest parallel_linearization
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --enable-parallel-linearization=10
+  GTEST_FILTER "MultiFragArrayParallelLinearizationTest.*")
 
 ##########
 

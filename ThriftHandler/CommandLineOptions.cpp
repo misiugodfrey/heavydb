@@ -966,6 +966,11 @@ void CommandLineOptions::fillDeveloperOptions() {
   po::options_description& desc = developer_desc_;
 
   desc.add_options()("dev-options", "Print internal developer options.");
+  desc.add_options()("enable-parallel-linearization",
+                     po::value<size_t>(&g_enable_parallel_linearization)
+                         ->default_value(g_enable_parallel_linearization),
+                     "Minimum number of rows in a chunk for which varlen columns are "
+                     "linearized in parallel.");
 #ifdef HAVE_RENDERING
   desc.add_options()(
       "render-compositor-use-last-gpu",

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "SqlTestFixture.h"
 #include "TestHelpers.h"
 
 #include <algorithm>
@@ -10,8 +11,8 @@
 #include <string>
 #include <vector>
 
-#include "../QueryEngine/Execute.h"
-#include "../QueryRunner/QueryRunner.h"
+#include <boost/algorithm/string/join.hpp>
+#include <boost/program_options.hpp>
 
 #ifndef BASE_PATH
 #define BASE_PATH "./tmp"
@@ -19,7 +20,7 @@
 
 #define SKIP_NO_GPU()                                        \
   if (skip_tests(dt)) {                                      \
-    CHECK(dt == ExecutorDeviceType::GPU);                    \
+    CHECK(dt == TExecuteMode::GPU);                          \
     LOG(WARNING) << "GPU not available, skipping GPU tests"; \
     continue;                                                \
   }
@@ -27,42 +28,75 @@
 // SKIP_NO_GPU() but for parameterized tests which don't use a loop.
 #define SKIP_NO_GPU_P(dt)                                    \
   if (skip_tests(dt)) {                                      \
-    CHECK_EQ(ExecutorDeviceType::GPU, dt);                   \
+    CHECK_EQ(TExecuteMode::GPU, dt);                         \
     GTEST_SKIP() << "GPU not available, skipping GPU tests"; \
   }
 
 bool g_keep_data{false};
 
-extern bool g_is_test_env;
-
-using QR = QueryRunner::QueryRunner;
 using namespace TestHelpers;
 
 inline void run_ddl_statement(const std::string& input_str) {
-  QR::get()->runDDLStatement(input_str);
+  SqlTestFixture::sql(input_str);
 }
 
-std::shared_ptr<ResultSet> run_multiple_agg(const std::string& query_str,
-                                            const ExecutorDeviceType device_type) {
-  return QR::get()->runSQL(
-      query_str, device_type, /*hoist_literals=*/true, /*allow_loop_joins=*/true);
+std::shared_ptr<ThinResultSet> run_multiple_agg(const std::string& query_str,
+                                                const TExecuteMode::type device_type) {
+  return SqlTestFixture::run_multiple_agg(query_str, device_type);
 }
 
-bool skip_tests(const ExecutorDeviceType device_type) {
-#ifdef HAVE_CUDA
-  return device_type == ExecutorDeviceType::GPU && !(QR::get()->gpusPresent());
-#else
-  return device_type == ExecutorDeviceType::GPU;
-#endif
+bool skip_tests(const TExecuteMode::type device_type) {
+  return device_type == TExecuteMode::GPU && !SqlTestFixture::gpusPresent();
 }
+
+// The value ThinResultSet reports for a NULL element of an integer array.
+template <typename T>
+constexpr int64_t int_null_value();
+template <>
+constexpr int64_t int_null_value<int64_t>() {
+  return ThinResultSet::kNullBigint;
+}
+template <>
+constexpr int64_t int_null_value<int32_t>() {
+  return ThinResultSet::kNullInt;
+}
+template <>
+constexpr int64_t int_null_value<int16_t>() {
+  return ThinResultSet::kNullSmallint;
+}
+template <>
+constexpr int64_t int_null_value<int8_t>() {
+  return ThinResultSet::kNullTinyint;
+}
+
+template <typename T>
+constexpr T fp_null_value();
+template <>
+constexpr float fp_null_value<float>() {
+  return ThinResultSet::kNullFloat;
+}
+template <>
+constexpr double fp_null_value<double>() {
+  return ThinResultSet::kNullDouble;
+}
+
+// ThinDeviceParameterizedTest for the thin client.
+class ThinDeviceParameterizedTest : public ::testing::TestWithParam<TExecuteMode::type> {
+ protected:
+  void SetUp() override {
+    device_type_ = GetParam();
+    if (device_type_ == TExecuteMode::GPU && !SqlTestFixture::gpusPresent()) {
+      GTEST_SKIP() << "Unsupported device type: " << device_type_;
+    }
+  }
+
+  TExecuteMode::type device_type_;
+};
 
 TargetValue execSQLWithAllowLoopJoin(const std::string& stmt,
-                                     const ExecutorDeviceType dt,
-                                     const bool geo_return_geo_tv = true) {
-  auto rows = QR::get()->runSQL(stmt, dt, true, true);
-  if (geo_return_geo_tv) {
-    rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
-  }
+                                     const TExecuteMode::type dt,
+                                     const bool /*geo_return_geo_tv*/ = true) {
+  auto rows = run_multiple_agg(stmt, dt);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size()) << stmt;
   return crt_row[0];
@@ -116,7 +150,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "{'a', 'b'}",
                          "{'a', 'b'}",
                          "{1, 2}"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
     run_multiple_agg(gen(1,
                          1,
                          1,
@@ -135,7 +169,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "{}",
                          "{}",
                          "{1, 2}"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
     run_multiple_agg(gen(0,
                          0,
                          0,
@@ -154,7 +188,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "{'z'}",
                          "{'x', 'y', 'z'}",
                          "{1, 2}"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
     run_multiple_agg(gen(0,
                          0,
                          0,
@@ -173,7 +207,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "NULL",
                          "NULL",
                          "NULL"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
     run_multiple_agg(gen("NULL",
                          "NULL",
                          "NULL",
@@ -192,7 +226,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "{'d', 'e'}",
                          "{'d', 'e'}",
                          "{4, 5}"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
     run_multiple_agg(gen("NULL",
                          "NULL",
                          "NULL",
@@ -211,7 +245,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
                          "NULL",
                          "NULL",
                          "NULL"),
-                     ExecutorDeviceType::CPU);
+                     TExecuteMode::CPU);
   }
 
   void TearDown() override {
@@ -222,7 +256,7 @@ class ArrayExtOpsEnv : public ::testing::Test {
 };
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendInteger) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
 
     auto check_row_result = [](const auto& crt_row, const auto& expected) {
@@ -246,41 +280,41 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendInteger) {
     {
       const auto rows = run_multiple_agg(
           "SELECT array_append(arri64, i64) FROM array_ext_ops_test;", dt);
-      check_entire_integer_result(rows, inline_int_null_value<int64_t>());
+      check_entire_integer_result(rows, int_null_value<int64_t>());
     }
 
     // i32
     {
       const auto rows = run_multiple_agg(
           "SELECT array_append(arri32, i32) FROM array_ext_ops_test;", dt);
-      check_entire_integer_result(rows, inline_int_null_value<int32_t>());
+      check_entire_integer_result(rows, int_null_value<int32_t>());
     }
 
     // i16
     {
       const auto rows = run_multiple_agg(
           "SELECT array_append(arri16, i16) FROM array_ext_ops_test;", dt);
-      check_entire_integer_result(rows, inline_int_null_value<int16_t>());
+      check_entire_integer_result(rows, int_null_value<int16_t>());
     }
 
     // i8
     {
       const auto rows =
           run_multiple_agg("SELECT array_append(arri8, i8) FROM array_ext_ops_test;", dt);
-      check_entire_integer_result(rows, inline_int_null_value<int8_t>());
+      check_entire_integer_result(rows, int_null_value<int8_t>());
     }
 
     // upcast
     {
       const auto rows = run_multiple_agg(
           "SELECT array_append(arri64, i8) FROM array_ext_ops_test;", dt);
-      check_entire_integer_result(rows, inline_int_null_value<int64_t>());
+      check_entire_integer_result(rows, int_null_value<int64_t>());
     }
   }
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendString) {
-  for (auto dt : {ExecutorDeviceType::CPU, /* ExecutorDeviceType::GPU */}) {
+  for (auto dt : {TExecuteMode::CPU, /* TExecuteMode::GPU */}) {
     SKIP_NO_GPU();
 
     auto check_row_result = [](const auto& row, const auto& expected) {
@@ -334,7 +368,7 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendString) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendBool) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     auto check_row_result = [](const auto& crt_row, const auto& expected) {
       compare_array(crt_row[0], expected);
@@ -358,13 +392,13 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendBool) {
     {
       const auto rows = run_multiple_agg(
           "SELECT barray_append(arri1, i1) FROM array_ext_ops_test;", dt);
-      check_entire_bool_result(rows, inline_int_null_value<int8_t>());
+      check_entire_bool_result(rows, int_null_value<int8_t>());
     }
   }
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendDouble) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     auto check_row_result = [](const auto& crt_row, const auto& expected) {
       compare_array(crt_row[0], expected);
@@ -377,9 +411,9 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendDouble) {
       check_row_result(rows->getNextRow(true, true), std::vector<double>{-1, 0});
       check_row_result(rows->getNextRow(true, true), std::vector<double>{0});
       check_row_result(rows->getNextRow(true, true),
-                       std::vector<double>{4, 5, inline_fp_null_value<double>()});
+                       std::vector<double>{4, 5, fp_null_value<double>()});
       check_row_result(rows->getNextRow(true, true),
-                       std::vector<double>{inline_fp_null_value<double>()});
+                       std::vector<double>{fp_null_value<double>()});
     };
 
     // double
@@ -392,7 +426,7 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendDouble) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendFloat) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     auto check_row_result = [](const auto& crt_row, const auto& expected) {
       compare_array(crt_row[0], expected);
@@ -405,9 +439,9 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendFloat) {
       check_row_result(rows->getNextRow(true, true), std::vector<float>{-1, 0});
       check_row_result(rows->getNextRow(true, true), std::vector<float>{0});
       check_row_result(rows->getNextRow(true, true),
-                       std::vector<float>{4, 5, inline_fp_null_value<float>()});
+                       std::vector<float>{4, 5, fp_null_value<float>()});
       check_row_result(rows->getNextRow(true, true),
-                       std::vector<float>{inline_fp_null_value<float>()});
+                       std::vector<float>{fp_null_value<float>()});
     };
 
     // float
@@ -420,7 +454,7 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendFloat) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayEqual) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     auto check_row_result =
         [](const auto& crt_row, const auto expected, const std::string& msg) {
@@ -527,7 +561,7 @@ TEST_F(ArrayExtOpsEnv, ArrayEqual) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayAppendDowncast) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
 
     // unsupported downcast
@@ -539,7 +573,7 @@ TEST_F(ArrayExtOpsEnv, ArrayAppendDowncast) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputScalarSameType) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     {
       const auto rows = run_multiple_agg(
@@ -556,7 +590,7 @@ TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputScalarSameType) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputScalarDiffType) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     {
       const auto rows = run_multiple_agg(
@@ -573,7 +607,7 @@ TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputScalarDiffType) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputArraySameType) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     {  // varlen array
       const auto rows = run_multiple_agg(
@@ -611,7 +645,7 @@ TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputArraySameType) {
 }
 
 TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputArrayDiffType) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     {
       const auto rows = run_multiple_agg(
@@ -649,7 +683,7 @@ TEST_F(ArrayExtOpsEnv, ArrayValidateRawInputArrayDiffType) {
 }
 
 TEST_F(ArrayExtOpsEnv, CardinalityWithUdf) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     {
       EXPECT_ANY_THROW(
@@ -664,12 +698,12 @@ TEST_F(ArrayExtOpsEnv, CardinalityWithUdf) {
 
 TEST_F(ArrayExtOpsEnv, CardinalityForConstantArray) {
   auto check_row_result =
-      [](const auto& crt_row, int64_t expected, ExecutorDeviceType dt) {
+      [](const auto& crt_row, int64_t expected, TExecuteMode::type dt) {
         auto const res = v<int64_t>(crt_row[0]);
         ASSERT_EQ(res, expected)
             << "device: " << dt << ", expected: " << expected << ", but return :" << res;
       };
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
     check_row_result(
         run_multiple_agg("SELECT CARDINALITY({});", dt)->getNextRow(false, false), 0, dt);
@@ -740,59 +774,50 @@ class TinyIntArrayImportTest : public ::testing::Test {
 };
 
 TEST_F(TinyIntArrayImportTest, TinyIntImportBugTest) {
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES (NULL);",
-                                    ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES (NULL);", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
 
   TearDown();
   SetUp();
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES (NULL);",
-                                    ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES (NULL);", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
 
   TearDown();
   SetUp();
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES (NULL);",
-                                    ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES (NULL);", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
   ASSERT_NO_THROW(
-      QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({});", ExecutorDeviceType::CPU));
-  ASSERT_NO_THROW(QR::get()->runSQL("INSERT INTO tinyint_arr VALUES ({1});",
-                                    ExecutorDeviceType::CPU));
+      run_multiple_agg("INSERT INTO tinyint_arr VALUES ({});", TExecuteMode::CPU));
+  ASSERT_NO_THROW(run_multiple_agg("INSERT INTO tinyint_arr VALUES ({1});", TExecuteMode::CPU));
 }
 
 class MultiFragArrayJoinTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n;");
     std::vector<std::string> integer_type_cols{"tiv tinyint[]",
                                                "tif tinyint[3]",
                                                "siv smallint[]",
@@ -1097,14 +1122,14 @@ class MultiFragArrayJoinTest : public ::testing::Test {
         }
       }
       for (auto& dml : insert_dml_vec) {
-        QR::get()->runSQL(dml, ExecutorDeviceType::CPU);
+        run_multiple_agg(dml, TExecuteMode::CPU);
       }
       col_count = 0;
     };
-    QR::get()->runDDLStatement(create_table_ddl_gen("sfarr", false));
-    QR::get()->runDDLStatement(create_table_ddl_gen("mfarr", true));
-    QR::get()->runDDLStatement(create_table_ddl_gen("sfarr_n", false));
-    QR::get()->runDDLStatement(create_table_ddl_gen("mfarr_n", true));
+    run_ddl_statement(create_table_ddl_gen("sfarr", false));
+    run_ddl_statement(create_table_ddl_gen("mfarr", true));
+    run_ddl_statement(create_table_ddl_gen("sfarr_n", false));
+    run_ddl_statement(create_table_ddl_gen("mfarr_n", true));
 
     insert_dml_gen("sfarr", false);
     insert_dml_gen("mfarr", false);
@@ -1113,10 +1138,10 @@ class MultiFragArrayJoinTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n;");
   }
 };
 
@@ -1133,7 +1158,7 @@ TEST_F(MultiFragArrayJoinTest, IndexedArrayJoin) {
     std::vector<std::string> text_array_types{"txv", "txve", "txf", "txfe"};
     std::vector<std::string> bool_types{"boolf", "boolv"};
     auto run_tests = [](const std::vector<std::string> col_types) {
-      for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+      for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
         SKIP_NO_GPU();
         for (const auto& col_name : col_types) {
           std::ostringstream sq, q1;
@@ -1174,7 +1199,7 @@ TEST_F(MultiFragArrayJoinTest, IndexedArrayJoin) {
         "txv", "txve"};  // skip txf text[3] / txfe text[3] encoding dict (32)
     std::vector<std::string> bool_types{"boolf", "boolv"};
     auto run_tests = [](const std::vector<std::string> col_types) {
-      for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+      for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
         SKIP_NO_GPU();
         for (const auto& col_name : col_types) {
           std::ostringstream sq, q1;
@@ -1206,13 +1231,12 @@ TEST_F(MultiFragArrayJoinTest, IndexedArrayJoin) {
 class MultiFragArrayParallelLinearizationTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n2;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n2;");
-    g_enable_parallel_linearization = 10;
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n2;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n2;");
 
     std::vector<std::string> cols{"tiv tinyint[]",
                                   "siv smallint[]",
@@ -1240,12 +1264,12 @@ class MultiFragArrayParallelLinearizationTest : public ::testing::Test {
       return oss.str();
     };
 
-    QR::get()->runDDLStatement(create_table_ddl_gen("sfarr", false));
-    QR::get()->runDDLStatement(create_table_ddl_gen("mfarr", true));
-    QR::get()->runDDLStatement(create_table_ddl_gen("sfarr_n", false));
-    QR::get()->runDDLStatement(create_table_ddl_gen("mfarr_n", true));
-    QR::get()->runDDLStatement(create_table_ddl_gen("sfarr_n2", false));
-    QR::get()->runDDLStatement(create_table_ddl_gen("mfarr_n2", true));
+    run_ddl_statement(create_table_ddl_gen("sfarr", false));
+    run_ddl_statement(create_table_ddl_gen("mfarr", true));
+    run_ddl_statement(create_table_ddl_gen("sfarr_n", false));
+    run_ddl_statement(create_table_ddl_gen("mfarr_n", true));
+    run_ddl_statement(create_table_ddl_gen("sfarr_n2", false));
+    run_ddl_statement(create_table_ddl_gen("mfarr_n2", true));
 
     auto insert_table = [](const std::string& tbl_name,
                            int num_tuples,
@@ -1382,7 +1406,7 @@ class MultiFragArrayParallelLinearizationTest : public ::testing::Test {
       }
 
       for (auto& dml : insert_dml_vec) {
-        QR::get()->runSQL(dml, ExecutorDeviceType::CPU);
+        run_multiple_agg(dml, TExecuteMode::CPU);
       }
     };
 
@@ -1395,13 +1419,12 @@ class MultiFragArrayParallelLinearizationTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS sfarr_n2;");
-    QR::get()->runDDLStatement("DROP TABLE IF EXISTS mfarr_n2;");
-    g_enable_parallel_linearization = 20000;
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n;");
+    run_ddl_statement("DROP TABLE IF EXISTS sfarr_n2;");
+    run_ddl_statement("DROP TABLE IF EXISTS mfarr_n2;");
   }
 };
 
@@ -1417,7 +1440,7 @@ TEST_F(MultiFragArrayParallelLinearizationTest, IndexedArrayJoin) {
   // case 1. non_null
   {
     auto run_tests = [](const std::vector<std::string> col_types) {
-      for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+      for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
         SKIP_NO_GPU();
         for (const auto& col_name : col_types) {
           std::ostringstream sq, q1;
@@ -1442,7 +1465,7 @@ TEST_F(MultiFragArrayParallelLinearizationTest, IndexedArrayJoin) {
   // case 2-a. nullable having first row of each frag is null row
   {
     auto run_tests = [](const std::vector<std::string> col_types) {
-      for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+      for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
         SKIP_NO_GPU();
         for (const auto& col_name : col_types) {
           std::ostringstream sq, q1;
@@ -1467,7 +1490,7 @@ TEST_F(MultiFragArrayParallelLinearizationTest, IndexedArrayJoin) {
   // case 2-b. nullable having first row of each frag is non-null row
   {
     auto run_tests = [](const std::vector<std::string> col_types) {
-      for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+      for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
         SKIP_NO_GPU();
         for (const auto& col_name : col_types) {
           std::ostringstream sq, q1;
@@ -1490,7 +1513,7 @@ TEST_F(MultiFragArrayParallelLinearizationTest, IndexedArrayJoin) {
   }
 }
 
-class ArrayConditionalExpressionTest : public ExecutorDeviceParameterizedTest {
+class ArrayConditionalExpressionTest : public ThinDeviceParameterizedTest {
  public:
   static void SetUpTestSuite() {
     run_ddl_statement(
@@ -1498,7 +1521,7 @@ class ArrayConditionalExpressionTest : public ExecutorDeviceParameterizedTest {
     run_multiple_agg(
         "INSERT INTO array_test VALUES (1, {1, 2, 3}, NULL), (1, NULL, {4, 5, 6}), (1, "
         "{1, 2}, {3, 4});",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
   }
 
   static void TearDownTestSuite() {
@@ -1512,14 +1535,14 @@ class ArrayConditionalExpressionTest : public ExecutorDeviceParameterizedTest {
       run_multiple_agg(query, device_type_);
       FAIL() << "An exception should have been thrown for this test case";
     } catch (const std::exception& e) {
-      ASSERT_STREQ(
-          "Array column projections are currently not supported in conditional "
-          "expressions.",
-          e.what());
+      // Thrift wraps the server's message, so check that it is contained.
+      ASSERT_NE(std::string(e.what())
+                    .find("Array column projections are currently not supported in "
+                          "conditional expressions."),
+                std::string::npos)
+          << e.what();
     }
   }
-
-  bool gpusPresent() override { return QR::get()->gpusPresent(); }
 };
 
 TEST_P(ArrayConditionalExpressionTest, Coalesce) {
@@ -1549,12 +1572,12 @@ TEST_P(ArrayConditionalExpressionTest, CaseExprNullBetweenThenAndElseCondition) 
 
 INSTANTIATE_TEST_SUITE_P(CpuAndGpuExecutorDevices,
                          ArrayConditionalExpressionTest,
-                         ::testing::Values(ExecutorDeviceType::CPU,
-                                           ExecutorDeviceType::GPU),
+                         ::testing::Values(TExecuteMode::CPU,
+                                           TExecuteMode::GPU),
                          ::testing::PrintToStringParamName());
 
 TEST(Select, LiteralDecimals) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+  for (auto dt : {TExecuteMode::CPU, TExecuteMode::GPU}) {
     SKIP_NO_GPU();
 
     // Verify decimal values of different precision and scale
@@ -1582,7 +1605,7 @@ struct ArrayDotProductParam {
   char const* rhs;
 };
 
-using ArrayDotProductTuple = std::tuple<ExecutorDeviceType, ArrayDotProductParam>;
+using ArrayDotProductTuple = std::tuple<TExecuteMode::type, ArrayDotProductParam>;
 
 class ArrayDotProductTest : public testing::TestWithParam<ArrayDotProductTuple> {
  public:
@@ -1599,27 +1622,27 @@ class ArrayDotProductTest : public testing::TestWithParam<ArrayDotProductTuple> 
         "INSERT INTO dot_product_test VALUES (0, 8, 16, 32, 64, 32.0, 64.0, {1, 2, 3},"
         " {1, 2, 3}, {1, 2, 3}, {1, 2, 3}, {1., 2., 3.}, {1., 2., 3.}, {1., 2., 3.},"
         " NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
     run_multiple_agg(
         "INSERT INTO dot_product_test VALUES (1, 8, 16, 32, 64, 32.0, 64.0, {1, 2, 3},"
         " {1, 2, 3}, {1, 2, 3}, {1, 2, 3}, {1., 2., 3.}, {1., 2., 3.}, {1., 2., 3.},"
         " NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
     run_multiple_agg(
         "INSERT INTO dot_product_test VALUES (2, 8, 16, 32, 64, 32.0, 64.0, {1, 2, 3},"
         " {1, 2, 3}, {1, 2, 3}, {1, 2, 3}, {1., 2., 3.}, {1., 2., 3.}, {1., 2., 3.},"
         " NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
     run_multiple_agg(
         "INSERT INTO dot_product_test VALUES (3, 8, 16, 32, 64, 32.0, 64.0, {1, 2, 3},"
         " {1, 2, 3}, {1, 2, 3}, {1, 2, 3}, {1., 2., 3.}, {1., 2., 3.}, {1., 2., 3.},"
         " NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
     run_multiple_agg(
         "INSERT INTO dot_product_test VALUES (4, 8, 16, 32, 64, 32.0, 64.0, {1, 2, 3},"
         " {1, 2, 3}, {1, 2, 3}, {1, 2, 3}, {1., 2., 3.}, {1., 2., 3.}, {1., 2., 3.},"
         " NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
   }
 
   static void TearDownTestSuite() {
@@ -1683,7 +1706,7 @@ INSTANTIATE_TEST_SUITE_P(
     BasicValues,
     ArrayDotProductTest,
     testing::Combine(
-        testing::Values(ExecutorDeviceType::CPU, ExecutorDeviceType::GPU),
+        testing::Values(TExecuteMode::CPU, TExecuteMode::GPU),
         testing::Values(ArrayDotProductParam{'i', 14, "i8", "i8"},
                         ArrayDotProductParam{'i', 14, "i8", "i16"},
                         ArrayDotProductParam{'i', 14, "i8", "i32"},
@@ -1748,7 +1771,7 @@ class ArrayDotProductVarlenTest : public ArrayDotProductTest {
     run_multiple_agg(
         "INSERT INTO dot_product_varlen_test VALUES ({1,2}, {1,2,3}, {1,2}, {1,2,3}, "
         "NULL);",
-        ExecutorDeviceType::CPU);
+        TExecuteMode::CPU);
   }
 
   static void TearDownTestSuite() {
@@ -1794,7 +1817,7 @@ INSTANTIATE_TEST_SUITE_P(
     VarlenArrays,
     ArrayDotProductVarlenTest,
     testing::Combine(
-        testing::Values(ExecutorDeviceType::CPU, ExecutorDeviceType::GPU),
+        testing::Values(TExecuteMode::CPU, TExecuteMode::GPU),
         testing::Values(ArrayDotProductParam{'i', 5, "{1,2}", "{1,2}"},
                         ArrayDotProductParam{'i', {}, "{1,2}", "{1,2,3}"},
                         ArrayDotProductParam{'d', 5, "{1,2}", "fixlen2"},
@@ -1852,7 +1875,7 @@ INSTANTIATE_TEST_SUITE_P(
     NonArrayAndMultidimensional,
     ArrayDotProductExceptionsTest,
     testing::Combine(
-        testing::Values(ExecutorDeviceType::CPU, ExecutorDeviceType::GPU),
+        testing::Values(TExecuteMode::CPU, TExecuteMode::GPU),
         testing::Values(ArrayDotProductParam{{}, {}, "1.0", "{1.0,2.0}"},
                         ArrayDotProductParam{{}, {}, "{1.0,2.0}", "1.0"},
                         ArrayDotProductParam{{}, {}, "i8", "{1.0,i8val,3.0}"},
@@ -1878,8 +1901,6 @@ INSTANTIATE_TEST_SUITE_P(
     ArrayDotProductExceptionsTest::printTestParams);
 
 int main(int argc, char** argv) {
-  g_is_test_env = true;
-
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
   namespace po = boost::program_options;
@@ -1887,19 +1908,16 @@ int main(int argc, char** argv) {
   po::options_description desc("Options");
   desc.add_options()("keep-data", "Don't drop tables at the end of the tests");
 
-  logger::LogOptions log_options(argv[0]);
-  log_options.max_files_ = 0;  // stderr only by default
-  desc.add(log_options.get_options());
-
   po::variables_map vm;
-  po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
+  po::store(po::command_line_parser(argc, argv).options(desc).allow_unregistered().run(),
+            vm);
   po::notify(vm);
 
   if (vm.count("keep-data")) {
     g_keep_data = true;
   }
 
-  QR::init(BASE_PATH);
+  SqlTestFixture::initConnection(argc, argv);
 
   int err{0};
   try {
@@ -1907,6 +1925,5 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  QR::reset();
   return err;
 }
