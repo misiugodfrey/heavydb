@@ -10,10 +10,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <boost/filesystem.hpp>
 #include <sstream>
 
-#include "DBHandlerTestHelpers.h"
+#include "Logger/Logger.h"
+#include "Shared/misc.h"
 #include "Shared/scope.h"
+#include "SqlTestFixture.h"
 #include "TestHelpers.h"
 
 #ifndef BASE_PATH
@@ -22,11 +25,14 @@
 
 using namespace TestHelpers;
 
-extern bool g_enable_string_functions;
-extern bool g_enable_watchdog;
-extern size_t g_watchdog_none_encoded_string_translation_limit;
-extern std::string g_heavyiq_url;
-extern int64_t g_llm_transform_max_num_unique_value;
+// Thin-client test: it runs against a live heavydb. The four tests that changed a server
+// global in process run in their own ctest entries against a server started with the
+// matching flag (see CMakeLists.txt), and are excluded from the default entry:
+//   SelectLowercase_StringFunctionsDisabled               --enable-string-functions=false
+//   SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit  --enable-watchdog=true
+//                                    --watchdog-none-encoded-string-translation-limit=3
+//   LLMTransformCurlError                                 --iq-url=http://localhost:99999
+//   LLMTransformNDVWatchdogLimit                          --llm-transform-max-num-unique-value=1
 
 // begin string function tests
 
@@ -34,7 +40,7 @@ extern int64_t g_llm_transform_max_num_unique_value;
  * @brief Class used for setting up and tearing down tables and records that are required
  * by the string function test cases
  */
-class StringFunctionTest : public DBHandlerTestFixture,
+class StringFunctionTest : public SqlTestFixture,
                            public ::testing::WithParamInterface<TExecuteMode::type> {
  public:
   static void SetUpTestSuite() {
@@ -154,7 +160,7 @@ class StringFunctionTest : public DBHandlerTestFixture,
 
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     auto device_type = GetParam();
     if (!setExecuteMode(device_type)) {
       GTEST_SKIP() << device_type << " is not enabled.";
@@ -2017,35 +2023,19 @@ TEST_P(StringFunctionTest, LowercaseNullColumn) {
 }
 
 TEST_P(StringFunctionTest, SelectLowercase_StringFunctionsDisabled) {
-  const auto previous_string_function_state = g_enable_string_functions;
-  ScopeGuard reset_string_function_state = [&previous_string_function_state] {
-    g_enable_string_functions = previous_string_function_state;
-  };
-  g_enable_string_functions = false;
   queryAndAssertException("select lower(first_name) from string_function_test_people;",
                           "Function LOWER not supported.");
 }
 
 TEST_P(StringFunctionTest, SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit) {
-  const auto previous_watchdog_state = g_enable_watchdog;
-  const auto previous_none_encoded_translation_limit =
-      g_watchdog_none_encoded_string_translation_limit;
-  ScopeGuard reset_watchdog_state = [&previous_watchdog_state,
-                                     &previous_none_encoded_translation_limit] {
-    g_enable_watchdog = previous_watchdog_state;
-    g_watchdog_none_encoded_string_translation_limit =
-        previous_none_encoded_translation_limit;
-  };
-  g_enable_watchdog = true;
-  g_watchdog_none_encoded_string_translation_limit = 3;
-
+  constexpr size_t kNoneEncodedTranslationLimit{3};  // the server flag value
   std::ostringstream expected_error;
   expected_error
       << "Query requires one or more casts between none-encoded and "
          "dictionary-encoded "
       << "strings, and the estimated table size (4 rows) "
       << "exceeds the configured watchdog none-encoded string translation limit of "
-      << g_watchdog_none_encoded_string_translation_limit << " rows.";
+      << kNoneEncodedTranslationLimit << " rows.";
   queryAndAssertException("select lower(last_name) from string_function_test_people;",
                           expected_error.str());
 }
@@ -2589,8 +2579,6 @@ TEST_P(StringFunctionTest, TextEncodingDictCopyFromUDF) {
 }
 
 TEST_P(StringFunctionTest, LLMTransformCurlError) {
-  ScopeGuard reset = [orig = g_heavyiq_url]() { g_heavyiq_url = orig; };
-  g_heavyiq_url = "http://localhost:99999";
   queryAndAssertPartialException(
       "SELECT LLM_TRANSFORM(short_name, \'Return the capital of the following "
       "state\') FROM text_enc_test",
@@ -2619,10 +2607,6 @@ TEST_P(StringFunctionTest, LLMTransformConstraintFormatCheck) {
 }
 
 TEST_P(StringFunctionTest, LLMTransformNDVWatchdogLimit) {
-  ScopeGuard reset = [orig = g_llm_transform_max_num_unique_value]() {
-    g_llm_transform_max_num_unique_value = orig;
-  };
-  g_llm_transform_max_num_unique_value = 1;
   queryAndAssertPartialException(
       "SELECT LLM_TRANSFORM(first_name, \'haha\') FROM string_function_test_people;",
       "The number of entries of a string dictionary of the input argument of the "
@@ -2706,16 +2690,17 @@ const char* kNoneEncodedTextColumnType{"NoneEncodedTextColumn"};
 // column), our importer automatically drops the spaces, and there seems
 // no easy way in Postgres to force quoting everything.
 class PostgresStringFunctionTest
-    : public DBHandlerTestFixture,
+    : public SqlTestFixture,
       public ::testing::WithParamInterface<std::tuple<TExecuteMode::type, std::string>> {
  public:
   static void SetUpTestSuite() {
     ASSERT_NO_THROW(sql("DROP TABLE IF EXISTS postgres_osm_names;"));
     ASSERT_NO_THROW(sql(kCreatePostgresOsmNamesDdl));
-    ASSERT_NO_THROW(
-        sql("COPY postgres_osm_names FROM "
-            "'../../Tests/Import/datafiles/string_funcs/"
-            "postgres_osm_names_ascii_1k.csv.gz' WITH (header='true');"));
+    // the server resolves relative paths against its own working directory
+    const auto csv_path = boost::filesystem::canonical(
+        "../../Tests/Import/datafiles/string_funcs/postgres_osm_names_ascii_1k.csv.gz");
+    ASSERT_NO_THROW(sql("COPY postgres_osm_names FROM '" + csv_path.string() +
+                        "' WITH (header='true');"));
 
     TQueryResult result;
     sql(result, "SELECT COUNT(*) FROM postgres_osm_names;");
@@ -2730,7 +2715,7 @@ class PostgresStringFunctionTest
 
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     auto device_type = std::get<0>(GetParam());
     if (!setExecuteMode(device_type)) {
       GTEST_SKIP() << device_type << " is not enabled.";
@@ -2805,7 +2790,7 @@ struct QueryParams {
 };
 
 class OverlayStringFunctionTest
-    : public DBHandlerTestFixture,
+    : public SqlTestFixture,
       public ::testing::WithParamInterface<
           std::tuple<TExecuteMode::type, std::string, std::string>> {
  public:
@@ -2815,7 +2800,7 @@ class OverlayStringFunctionTest
 
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     const auto& [device_type, test_function, encoding_type] = GetParam();
     if (!setExecuteMode(device_type)) {
       GTEST_SKIP() << device_type << " is not enabled.";
@@ -2988,18 +2973,14 @@ INSTANTIATE_TEST_SUITE_P(
 int main(int argc, char** argv) {
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
-  g_enable_string_functions = true;
-  g_enable_watchdog = true;
-  g_watchdog_none_encoded_string_translation_limit = 1000000UL;
 
   int err{0};
   try {
-    testing::AddGlobalTestEnvironment(new DBHandlerTestEnvironment);
+    SqlTestFixture::initConnection(argc, argv);
     err = RUN_ALL_TESTS();
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
+    err = 1;
   }
-
-  g_enable_string_functions = false;
   return err;
 }

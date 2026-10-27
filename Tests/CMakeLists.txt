@@ -839,10 +839,24 @@ list(APPEND SANITY_TESTS StringDictionaryHashTest)
 
 ##########
 
-add_executable(StringFunctionsTest StringFunctionsTest.cpp)
-target_link_libraries(StringFunctionsTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-add_test(StringFunctionsTest StringFunctionsTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS StringFunctionsTest)
+# The in-process main() ran with g_enable_watchdog = true. Four tests changed a server global
+# in process, so each runs against a server started with that setting instead (the default
+# entry excludes them); the filters must stay in sync with the list in StringFunctionsTest.cpp.
+add_thin_client_test(StringFunctionsTest
+  SERVER_FLAGS --enable-watchdog=true
+  GTEST_FILTER "-*SelectLowercase_StringFunctionsDisabled*:*SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit*:*LLMTransformCurlError*:*LLMTransformNDVWatchdogLimit*")
+add_thin_client_test_variant(StringFunctionsTest string_functions_disabled
+  SERVER_FLAGS --enable-watchdog=true --enable-string-functions=false
+  GTEST_FILTER "*SelectLowercase_StringFunctionsDisabled*")
+add_thin_client_test_variant(StringFunctionsTest watchdog_limit
+  SERVER_FLAGS --enable-watchdog=true --watchdog-none-encoded-string-translation-limit=3
+  GTEST_FILTER "*SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit*")
+add_thin_client_test_variant(StringFunctionsTest llm_curl_error
+  SERVER_FLAGS --enable-watchdog=true --iq-url=http://localhost:99999
+  GTEST_FILTER "*LLMTransformCurlError*")
+add_thin_client_test_variant(StringFunctionsTest llm_ndv_limit
+  SERVER_FLAGS --enable-watchdog=true --llm-transform-max-num-unique-value=1
+  GTEST_FILTER "*LLMTransformNDVWatchdogLimit*")
 
 ##########
 
