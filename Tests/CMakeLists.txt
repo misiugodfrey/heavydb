@@ -366,10 +366,23 @@ list(APPEND SANITY_TEST_PROGRAMS DiskCacheQueryTest)
 
 ##########
 
-add_executable(DumpRestoreTest DumpRestoreTest.cpp)
-target_link_libraries(DumpRestoreTest ${EXECUTE_TEST_LIBS})
-add_test(DumpRestoreTest DumpRestoreTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS DumpRestoreTest)
+# The in-process tests ran QueryRunner queries with loop joins allowed and without view
+# optimization. The migrate-with-rollback tests set g_test_rollback_dump_restore in process,
+# so they run against a server started with --test-rollback-dump-restore (the default entry
+# excludes them); the filters must stay in sync with DumpRestoreTest.cpp.
+add_thin_client_test(DumpRestoreTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-*DumpMigrate_Rollback*:*DumpMigrate_Altered_Rollback*")
+add_thin_client_test_variant(DumpRestoreTest rollback
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --test-rollback-dump-restore
+  GTEST_FILTER "*DumpMigrate_Rollback*:*DumpMigrate_Altered_Rollback*")
+
+# Split out of DumpRestoreTest: needs the test-only Catalog::setUncappedTableEpoch() and the
+# AWS SDK in the test process, so it keeps the in-process fixture.
+add_executable(DumpRestoreInternalsTest DumpRestoreInternalsTest.cpp)
+target_link_libraries(DumpRestoreInternalsTest ${EXECUTE_TEST_LIBS})
+add_test(DumpRestoreInternalsTest DumpRestoreInternalsTest ${TEST_ARGS})
+list(APPEND SANITY_TEST_PROGRAMS DumpRestoreInternalsTest)
 
 ##########
 
