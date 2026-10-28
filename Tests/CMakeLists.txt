@@ -169,10 +169,16 @@ add_thin_client_test_variant(AlterSystemTest cpu_only
 
 ##########
 
-add_executable(AlterTableDdlTest AlterTableDdlTest.cpp)
-target_link_libraries(AlterTableDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-add_test(AlterTableDdlTest AlterTableDdlTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS AlterTableDdlTest)
+# The in-process main() also initialised a QueryRunner, so queries ran with loop joins
+# allowed and without view optimization. Drop_columns_rollback set g_test_drop_column_rollback
+# in process, so it runs against a server started with --test-drop-column-rollback (the
+# default entry excludes it); the filters must stay in sync with AlterTableDdlTest.cpp.
+add_thin_client_test(AlterTableDdlTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-AlterColumnTest4.Drop_columns_rollback")
+add_thin_client_test_variant(AlterTableDdlTest drop_column_rollback
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --test-drop-column-rollback
+  GTEST_FILTER "AlterColumnTest4.Drop_columns_rollback")
 
 ##########
 
