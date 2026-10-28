@@ -9,15 +9,9 @@
 #include <boost/iterator/counting_iterator.hpp>
 #include "boost/filesystem.hpp"
 
-#include "Catalog/Catalog.h"
-#include "DBHandlerTestHelpers.h"
-#include "Fragmenter/InsertOrderFragmenter.h"
-#include "Geospatial/Types.h"
-#include "ImportExport/Importer.h"
-#include "QueryEngine/ResultSet.h"
-#include "QueryRunner/QueryRunner.h"
-#include "Shared/UpdelRoll.h"
+#include "Fragmenter/FragmentDefaultValues.h"
 #include "Shared/scope.h"
+#include "SqlTestFixture.h"
 #include "Tests/TestHelpers.h"
 
 #include <tuple>
@@ -25,37 +19,20 @@
 #define BASE_PATH "./tmp"
 #endif
 
-using namespace Catalog_Namespace;
 using namespace TestHelpers;
-
-using QR = QueryRunner::QueryRunner;
-
-extern bool g_test_drop_column_rollback;
 
 namespace {
 
-bool g_hoist_literals{true};
-
 inline void run_ddl_statement(const std::string& input_str) {
-  QR::get()->runDDLStatement(input_str);
+  SqlTestFixture::sql(input_str);
 }
 
-std::shared_ptr<ResultSet> run_query(const std::string& query_str) {
-  return QR::get()->runSQL(query_str, ExecutorDeviceType::CPU, g_hoist_literals, true);
+std::shared_ptr<ThinResultSet> run_query(const std::string& query_str) {
+  return SqlTestFixture::run_multiple_agg(query_str, TExecuteMode::CPU);
 }
 
-std::unique_ptr<QR> get_qr_for_user(
-    const std::string& user_name,
-    const Catalog_Namespace::UserMetadata& user_metadata) {
-  auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
-      Catalog_Namespace::SysCatalog::instance().getCatalog(user_name),
-      user_metadata,
-      ExecutorDeviceType::CPU,
-      "");
-  return std::make_unique<QR>(std::move(session));
-}
-
-template <typename E = std::runtime_error>
+// Thrift reports errors as TDBException, which is not a std::runtime_error.
+template <typename E = std::exception>
 bool alter_common(const std::string& table,
                   const std::string& column,
                   const std::string& type,
@@ -127,17 +104,9 @@ bool alter_common(const std::string& table,
 }
 
 void import_table_file(const std::string& table, const std::string& file) {
-  const auto query_str = std::string("COPY trips FROM '") +
-                         "../../Tests/Import/datafiles/" + file +
-                         "' WITH (header='true');";
-
-  auto stmt = QR::get()->createStatement(query_str);
-
-  auto copy_stmt = dynamic_cast<Parser::CopyTableStmt*>(stmt.get());
-  if (!copy_stmt) {
-    throw std::runtime_error("Expected a CopyTableStatment: " + query_str);
-  }
-  QR::get()->runImport(copy_stmt);
+  const auto path = boost::filesystem::canonical("../../Tests/Import/datafiles/" + file);
+  run_ddl_statement("COPY trips FROM '" + path.string() +
+                    "' WITH (header='true');");
 }
 
 // don't use R"()" format; somehow it causes many blank lines
@@ -252,7 +221,7 @@ TEST(AlterColumnTest2, Drop_after_fail_to_add) {
   EXPECT_NO_THROW(run_query("insert into t values (10);"););
   EXPECT_THROW(
       run_ddl_statement("alter table t add column c2 TEXT NOT NULL ENCODING DICT;"),
-      std::runtime_error);
+      std::exception);
   EXPECT_NO_THROW(run_ddl_statement("drop table t;"););
 }
 
@@ -264,8 +233,8 @@ TEST(AlterColumnTest3, Add_col_to_sharded_table) {
   EXPECT_NO_THROW(run_query("insert into x values('0',0);"););
 }
 
+// With rollback, the server must have been started with --test-drop-column-rollback.
 void drop_columns(const bool rollback, const std::vector<std::string>&& dropped_columns) {
-  g_test_drop_column_rollback = rollback;
   std::vector<std::string> drop_column_phrases;
   std::transform(
       dropped_columns.begin(),
@@ -278,8 +247,8 @@ void drop_columns(const bool rollback, const std::vector<std::string>&& dropped_
   std::string drop_column_statement = "alter table t drop column " +
                                       boost::algorithm::join(drop_column_phrases, ",") +
                                       ";";
-  if (g_test_drop_column_rollback) {
-    EXPECT_THROW(run_ddl_statement(drop_column_statement), std::runtime_error);
+  if (rollback) {
+    EXPECT_THROW(run_ddl_statement(drop_column_statement), std::exception);
     for (const auto& dropped_column : dropped_columns) {
       EXPECT_NO_THROW(run_query("select count(" + dropped_column + ") from t;"));
     }
@@ -315,7 +284,6 @@ class AlterColumnTest4 : public ::testing::Test {
     EXPECT_NO_THROW(
         run_query(
             "insert into t values ('1', '1', 1, 'point(1 1)', 'point(1 1)', 1, 1);"););
-    g_test_drop_column_rollback = false;
   }
   void TearDown() override { EXPECT_NO_THROW(run_ddl_statement("drop table t;");); }
 };
@@ -338,22 +306,22 @@ TEST_F(AlterColumnTest4, Drop_column_referenced_by_view) {
 
 TEST_F(AlterColumnTest4, Alter_column_of_view) {
   EXPECT_NO_THROW(run_ddl_statement("create view v as select b from t;"););
-  EXPECT_THROW(run_ddl_statement("alter table v add column i int;"), std::runtime_error);
-  EXPECT_THROW(run_ddl_statement("alter table v drop column b;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("alter table v add column i int;"), std::exception);
+  EXPECT_THROW(run_ddl_statement("alter table v drop column b;"), std::exception);
 }
 
 TEST_F(AlterColumnTest4, Alter_inexistent_table) {
-  EXPECT_THROW(run_ddl_statement("alter table xx drop column xxx;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("alter table xx drop column xxx;"), std::exception);
 }
 
 TEST_F(AlterColumnTest4, Alter_inexistent_table_column) {
-  EXPECT_THROW(run_ddl_statement("alter table t drop column xxx;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("alter table t drop column xxx;"), std::exception);
 }
 
 TEST(AlterColumnTest5, Drop_the_only_column) {
   EXPECT_NO_THROW(run_ddl_statement("drop table if exists x;"););
   EXPECT_NO_THROW(run_ddl_statement("create table x (i int);"););
-  EXPECT_THROW(run_ddl_statement("alter table x drop column i;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("alter table x drop column i;"), std::exception);
 }
 
 TEST(AlterColumnTest5, Drop_sharding_column) {
@@ -361,7 +329,7 @@ TEST(AlterColumnTest5, Drop_sharding_column) {
   EXPECT_NO_THROW(
       run_ddl_statement(
           "create table x (i int, j int, SHARD KEY (i)) WITH (SHARD_COUNT = 2);"););
-  EXPECT_THROW(run_ddl_statement("alter table x drop column i;"), std::runtime_error);
+  EXPECT_THROW(run_ddl_statement("alter table x drop column i;"), std::exception);
 }
 
 TEST(AlterColumnTest5, DISABLED_Drop_temp_table_column) {
@@ -385,49 +353,55 @@ TEST(AlterColumnTest5, Drop_table_by_unauthorized_user) {
   auto lucky = "lucky"s;
   auto lucky_password = "lucky"s;
   auto mydb = "mydb"s;
-  auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
   EXPECT_NO_THROW(run_ddl_statement("CREATE DATABASE mydb (owner='admin');"););
   EXPECT_NO_THROW(run_ddl_statement("CREATE USER thief (password='thief');"););
   EXPECT_NO_THROW(run_ddl_statement("CREATE USER lucky (password='lucky');"););
+  // A Thrift login, unlike the in-process one this test used, needs access to the database.
+  EXPECT_NO_THROW(run_ddl_statement("GRANT ACCESS ON DATABASE mydb TO thief;"););
+  EXPECT_NO_THROW(run_ddl_statement("GRANT ACCESS ON DATABASE mydb TO lucky;"););
   ScopeGuard scope_guard = [] {
     run_ddl_statement("DROP USER lucky;");
     run_ddl_statement("DROP USER thief;");
     run_ddl_statement("DROP DATABASE mydb;");
   };
+  auto run_in_session = [](const TSessionId& session, const std::string& query) {
+    TQueryResult result;
+    SqlTestFixture::getDbHandlerAndSessionId().first->sql_execute(
+        result, session, query, true, "", -1, -1);
+  };
   // login to mydb as admin
-  Catalog_Namespace::UserMetadata user_meta1;
-  EXPECT_NO_THROW(sys_cat.login(mydb, admin, admin_password, user_meta1, false););
-  auto qr1 = get_qr_for_user(mydb, user_meta1);
-  auto dt = ExecutorDeviceType::CPU;
-  EXPECT_NO_THROW(qr1->runDDLStatement("CREATE TABLE x (i int, j int, k int);"));
-  EXPECT_NO_THROW(qr1->runSQL("insert into x values (0, 0, 0);", dt));
-  EXPECT_NO_THROW(qr1->runDDLStatement("alter table x drop column k;"));
-  EXPECT_NO_THROW(qr1->runSQL("select i from x;", dt));
-  EXPECT_NO_THROW(qr1->runDDLStatement("grant alter on table x to lucky;"));
+  TSessionId session1;
+  EXPECT_NO_THROW(SqlTestFixture::login(admin, admin_password, mydb, session1););
+  ScopeGuard logout1 = [&] { SqlTestFixture::logout(session1); };
+  EXPECT_NO_THROW(run_in_session(session1, "CREATE TABLE x (i int, j int, k int);"));
+  EXPECT_NO_THROW(run_in_session(session1, "insert into x values (0, 0, 0);"));
+  EXPECT_NO_THROW(run_in_session(session1, "alter table x drop column k;"));
+  EXPECT_NO_THROW(run_in_session(session1, "select i from x;"));
+  EXPECT_NO_THROW(run_in_session(session1, "grant alter on table x to lucky;"));
   // login to mydb as thief
-  Catalog_Namespace::UserMetadata user_meta2;
-  EXPECT_NO_THROW(sys_cat.login(mydb, thief, thief_password, user_meta2, false));
-  auto qr2 = get_qr_for_user(mydb, user_meta2);
-  EXPECT_THROW(qr2->runDDLStatement("alter table x drop column j;"), std::runtime_error);
+  TSessionId session2;
+  EXPECT_NO_THROW(SqlTestFixture::login(thief, thief_password, mydb, session2));
+  ScopeGuard logout2 = [&] { SqlTestFixture::logout(session2); };
+  EXPECT_THROW(run_in_session(session2, "alter table x drop column j;"), std::exception);
   // login to mydb as lucky
-  Catalog_Namespace::UserMetadata user_meta3;
-  EXPECT_NO_THROW(sys_cat.login(mydb, lucky, lucky_password, user_meta3, false));
-  auto qr3 = get_qr_for_user(mydb, user_meta3);
-  EXPECT_NO_THROW(qr3->runDDLStatement("alter table x drop column j;"));
+  TSessionId session3;
+  EXPECT_NO_THROW(SqlTestFixture::login(lucky, lucky_password, mydb, session3));
+  ScopeGuard logout3 = [&] { SqlTestFixture::logout(session3); };
+  EXPECT_NO_THROW(run_in_session(session3, "alter table x drop column j;"));
 }
 
 }  // namespace
 
-class AlterTableSetMaxRowsTest : public DBHandlerTestFixture {
+class AlterTableSetMaxRowsTest : public SqlTestFixture {
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     sql("drop table if exists test_table;");
   }
 
   void TearDown() override {
     sql("drop table if exists test_table;");
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   void insertRange(size_t start, size_t end) {
@@ -437,8 +411,7 @@ class AlterTableSetMaxRowsTest : public DBHandlerTestFixture {
   }
 
   void assertMaxRows(int64_t max_rows) {
-    auto td = getCatalog().getMetadataForTable("test_table", false);
-    ASSERT_EQ(max_rows, td->maxRows);
+    ASSERT_EQ(max_rows, getTableDetails("test_table").max_rows);
   }
 };
 
@@ -497,10 +470,10 @@ TEST_F(AlterTableSetMaxRowsTest, EmptyTable) {
   sqlAndCompareResult("select * from test_table;", {});
 }
 
-class AlterTableAlterColumnTest : public DBHandlerTestFixture {
+class AlterTableAlterColumnTest : public SqlTestFixture {
  protected:
   void SetUp() override {
-    DBHandlerTestFixture::SetUp();
+    SqlTestFixture::SetUp();
     sql("DROP TABLE IF EXISTS test_table;");
     sql("DROP TABLE IF EXISTS test_temp_table;");
     sql("DROP VIEW IF EXISTS test_view;");
@@ -512,7 +485,7 @@ class AlterTableAlterColumnTest : public DBHandlerTestFixture {
     sql("DROP TABLE IF EXISTS test_temp_table;");
     sql("DROP VIEW IF EXISTS test_view;");
     sql("DROP FOREIGN TABLE IF EXISTS test_foreign_table;");
-    DBHandlerTestFixture::TearDown();
+    SqlTestFixture::TearDown();
   }
 
   static void createTestUser() {
@@ -565,11 +538,20 @@ class AlterTableAlterColumnTest : public DBHandlerTestFixture {
     sql("INSERT INTO " + table_name + " VALUES " + data_str + " ;");
   }
 
-  std::list<const ColumnDescriptor*> getAllColumns(const std::string& table_name) {
-    auto& catalog = getCatalog();
-    auto tid = catalog.getTableId(table_name);
-    CHECK(tid.has_value());
-    return catalog.getAllColumnMetadataForTable(tid.value(), false, false, false);
+  static std::vector<TColumnType> getAllColumns(const std::string& table_name) {
+    return getTableDetails(table_name).row_desc;
+  }
+
+  static bool sqlTypesMatch(const TTypeInfo& lhs, const TTypeInfo& rhs) {
+    return lhs.type == rhs.type && lhs.encoding == rhs.encoding &&
+           lhs.nullable == rhs.nullable && lhs.is_array == rhs.is_array &&
+           lhs.precision == rhs.precision && lhs.scale == rhs.scale &&
+           lhs.comp_param == rhs.comp_param && lhs.size == rhs.size;
+  }
+
+  static bool defaultsMatch(const TColumnType& lhs, const TColumnType& rhs) {
+    return lhs.__isset.default_value == rhs.__isset.default_value &&
+           (!lhs.__isset.default_value || lhs.default_value == rhs.default_value);
   }
 
   void compareSchemaToReference(
@@ -587,16 +569,14 @@ class AlterTableAlterColumnTest : public DBHandlerTestFixture {
     auto ref_cols = getAllColumns("reference_table");
     auto orig_cols = getAllColumns(table_name);
     ASSERT_EQ(ref_cols.size(), orig_cols.size());
-    for (auto rcd : ref_cols) {
+    for (const auto& rcd : ref_cols) {
       auto cdit = std::find_if(
-          orig_cols.begin(), orig_cols.end(), [&rcd](const ColumnDescriptor* cd) {
-            return cd->columnName == rcd->columnName;
+          orig_cols.begin(), orig_cols.end(), [&rcd](const TColumnType& cd) {
+            return cd.col_name == rcd.col_name;
           });
       ASSERT_NE(cdit, orig_cols.end());
-      auto comparison_result =
-          ddl_utils::alter_column_utils::compare_column_descriptors(*cdit, rcd);
-      ASSERT_TRUE(comparison_result.sql_types_match);
-      ASSERT_TRUE(comparison_result.defaults_match);
+      ASSERT_TRUE(sqlTypesMatch(cdit->col_type, rcd.col_type)) << rcd.col_name;
+      ASSERT_TRUE(defaultsMatch(*cdit, rcd)) << rcd.col_name;
     }
     sql("DROP TABLE reference_table;");
   }
@@ -1298,7 +1278,8 @@ TEST_F(AlterTableAlterColumnTest, TemporaryTable) {
 
 TEST_F(AlterTableAlterColumnTest, ForeignTable) {
   sql("CREATE FOREIGN TABLE test_foreign_table (a INT) SERVER default_local_delimited "
-      "WITH (file_path='../../Tests/FsiDataFiles/1.csv');");
+      "WITH (file_path='" +
+      boost::filesystem::canonical("../../Tests/FsiDataFiles/1.csv").string() + "');");
   queryAndAssertException(
       "ALTER TABLE test_foreign_table ALTER COLUMN txt TYPE TEXT;",
       "test_foreign_table is a foreign table. Use ALTER FOREIGN TABLE.");
@@ -1937,20 +1918,13 @@ int main(int argc, char** argv) {
   TestHelpers::init_logger_stderr_only(argc, argv);
   testing::InitGoogleTest(&argc, argv);
 
-  // Initialize DBHandler in order to ensure that QueryRunner uses the same SysCatalog
-  // instance.
-  DBHandlerTestFixture::createDBHandler();
-
-  // TODO: Replace use of QueryRunner with DBHandlerTestFixture
-  QR::init(BASE_PATH);
-
   int err{0};
   try {
-    testing::AddGlobalTestEnvironment(new DBHandlerTestEnvironment);
+    SqlTestFixture::initConnection(argc, argv);
     err = RUN_ALL_TESTS();
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
+    err = 1;
   }
-  QR::reset();
   return err;
 }

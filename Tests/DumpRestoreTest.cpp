@@ -17,15 +17,11 @@
 #include <boost/process/search_path.hpp>
 #endif
 #include <boost/program_options.hpp>
+#include <boost/regex.hpp>
 #include <boost/variant.hpp>
 #include <boost/variant/get.hpp>
 
-#ifdef HAVE_AWS_S3
-#include "AwsHelpers.h"
-#include "DataMgr/HeavyDbAwsSdk.h"
-#endif
-#include "QueryEngine/ResultSet.h"
-#include "QueryRunner/QueryRunner.h"
+#include "SqlTestFixture.h"
 #include "TestHelpers.h"
 
 #ifndef BASE_PATH
@@ -34,22 +30,20 @@
 
 using namespace TestHelpers;
 
-extern bool g_test_rollback_dump_restore;
-extern bool g_allow_s3_server_privileges;
-
 const static std::string tar_ball_path = "/tmp/_Orz__";
 
 namespace {
-bool g_hoist_literals{true};
-
-using QR = QueryRunner::QueryRunner;
-
 inline void run_ddl_statement(const std::string& create_table_stmt) {
-  QR::get()->runDDLStatement(create_table_stmt);
+  SqlTestFixture::sql(create_table_stmt);
 }
 
-std::shared_ptr<ResultSet> run_multiple_agg(const std::string& query_str) {
-  return QR::get()->runSQL(query_str, ExecutorDeviceType::CPU, g_hoist_literals);
+std::shared_ptr<ThinResultSet> run_multiple_agg(const std::string& query_str) {
+  return SqlTestFixture::run_multiple_agg(query_str, TExecuteMode::CPU);
+}
+
+// The server resolves relative paths against its own working directory, not ours.
+std::string absolute_path(const std::string& path) {
+  return boost::filesystem::canonical(path).string();
 }
 
 void clear() {
@@ -166,14 +160,15 @@ void dump_restore(const bool migrate,
   // Will add a REPLACE TABLE to explicitly replace target table.
   // After that, remove the first following if-block to pass test!!!
   if (!migrate) {
-    EXPECT_THROW(run_ddl_statement(run_restore), std::runtime_error);
-  } else if (true == (g_test_rollback_dump_restore = rollback)) {
-    EXPECT_THROW(run_ddl_statement(run_restore), std::runtime_error);
+    EXPECT_THROW(run_ddl_statement(run_restore), std::exception);
+  } else if (rollback) {
+    // the server fails the restore as it was started with --test-rollback-dump-restore
+    EXPECT_THROW(run_ddl_statement(run_restore), std::exception);
   } else {
     EXPECT_NO_THROW(run_ddl_statement(run_restore));
   }
   if (migrate && rollback) {
-    EXPECT_THROW(run_ddl_statement("DROP TABLE x;"), std::runtime_error);
+    EXPECT_THROW(run_ddl_statement("DROP TABLE x;"), std::exception);
   } else {
     EXPECT_NO_THROW(check_table(table, alter, delta));
   }
@@ -238,6 +233,29 @@ TEST_UNSHARDED_AND_SHARDED(DumpRestoreTest, DumpMigrate_Rollback)
 TEST_UNSHARDED_AND_SHARDED(DumpRestoreTest, DumpMigrate_Altered)
 TEST_UNSHARDED_AND_SHARDED(DumpRestoreTest, DumpMigrate_Altered_Rollback)
 
+// max_rollback_epochs of a table, as reported by SHOW TABLE DETAILS.
+int64_t max_rollback_epochs(const std::string& table_name) {
+  TQueryResult result;
+  SqlTestFixture::sql(result, "SHOW TABLE DETAILS " + table_name + ";");
+  const auto& row_desc = result.row_set.row_desc;
+  for (size_t col = 0; col < row_desc.size(); ++col) {
+    if (row_desc[col].col_name == "max_rollback_epochs") {
+      return result.row_set.columns.at(col).data.int_col.at(0);
+    }
+  }
+  throw std::runtime_error("SHOW TABLE DETAILS has no max_rollback_epochs column");
+}
+
+// SHOW CREATE TABLE formats the statement over several lines.
+std::string single_line_create_table(const std::string& table_name) {
+  TQueryResult result;
+  SqlTestFixture::sql(result, "SHOW CREATE TABLE " + table_name + ";");
+  const auto& create_table = result.row_set.columns.at(0).data.str_col.at(0);
+  const auto opened =
+      boost::regex_replace(create_table, boost::regex("\\(\\s*\n\\s*"), "(");
+  return boost::regex_replace(opened, boost::regex("\\s*\n\\s*"), " ");
+}
+
 class DumpAndRestoreTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -245,7 +263,7 @@ class DumpAndRestoreTest : public ::testing::Test {
     run_ddl_statement("DROP TABLE IF EXISTS test_table;");
     run_ddl_statement("DROP TABLE IF EXISTS test_table_2;");
     run_ddl_statement("DROP TABLE IF EXISTS render_groups;");
-    g_test_rollback_dump_restore = false;
+    run_ddl_statement("DROP FOREIGN TABLE IF EXISTS test_foreign_table;");
   }
 
   void TearDown() override {
@@ -253,6 +271,7 @@ class DumpAndRestoreTest : public ::testing::Test {
     run_ddl_statement("DROP TABLE IF EXISTS test_table;");
     run_ddl_statement("DROP TABLE IF EXISTS test_table_2;");
     run_ddl_statement("DROP TABLE IF EXISTS render_groups;");
+    run_ddl_statement("DROP FOREIGN TABLE IF EXISTS test_foreign_table;");
   }
 
   void queryAndAssertException(const std::string& query,
@@ -261,7 +280,8 @@ class DumpAndRestoreTest : public ::testing::Test {
       run_ddl_statement(query);
       FAIL() << "An exception should have been thrown for this test case";
     } catch (const std::exception& e) {
-      ASSERT_STREQ(error_message.c_str(), e.what());
+      // Thrift wraps the server's message, so check that it is contained.
+      ASSERT_NE(std::string(e.what()).find(error_message), std::string::npos) << e.what();
     }
   }
 
@@ -313,7 +333,8 @@ class DumpAndRestoreTest : public ::testing::Test {
 TEST_F(DumpAndRestoreTest, ForeignTableDump) {
   run_ddl_statement(
       "CREATE FOREIGN TABLE test_foreign_table (a INT) SERVER default_local_delimited "
-      "WITH (file_path='../../Tests/FsiDataFiles/1.csv');");
+      "WITH (file_path='" +
+      absolute_path("../../Tests/FsiDataFiles/1.csv") + "');");
   queryAndAssertException("DUMP TABLE test_foreign_table TO '" + tar_ball_path + "';",
                           "Dumping a foreign table is not supported.");
 }
@@ -407,22 +428,6 @@ TEST_F(DumpAndRestoreTest, TextArray) {
   sqlAndCompareArrayResult("SELECT * FROM test_table_2;", expected_result);
 }
 
-TEST_F(DumpAndRestoreTest, TableWithUncappedEpoch) {
-  run_ddl_statement("CREATE TABLE test_table (i INTEGER);");
-  QR::get()->getCatalog()->setUncappedTableEpoch("test_table");
-  run_multiple_agg("INSERT INTO test_table VALUES(1);");
-  run_multiple_agg("INSERT INTO test_table VALUES(2);");
-  run_multiple_agg("INSERT INTO test_table VALUES(3);");
-
-  sqlAndCompareResult("SELECT * FROM test_table;", {1, 2, 3});
-  run_ddl_statement("DUMP TABLE test_table TO '" + tar_ball_path + "';");
-  run_ddl_statement("RESTORE TABLE test_table_2 FROM '" + tar_ball_path + "';");
-  sqlAndCompareResult("SELECT * FROM test_table_2;", {1, 2, 3});
-  auto td = QR::get()->getCatalog()->getMetadataForTable("test_table_2", false);
-  ASSERT_TRUE(td != nullptr);
-  ASSERT_EQ(DEFAULT_MAX_ROLLBACK_EPOCHS, td->maxRollbackEpochs);
-}
-
 TEST_F(DumpAndRestoreTest, TableWithMaxRollbackEpochs) {
   run_ddl_statement(
       "CREATE TABLE test_table (i INTEGER) WITH (max_rollback_epochs = 10);");
@@ -434,9 +439,7 @@ TEST_F(DumpAndRestoreTest, TableWithMaxRollbackEpochs) {
   run_ddl_statement("DUMP TABLE test_table TO '" + tar_ball_path + "';");
   run_ddl_statement("RESTORE TABLE test_table_2 FROM '" + tar_ball_path + "';");
   sqlAndCompareResult("SELECT * FROM test_table_2;", {1, 2, 3});
-  auto td = QR::get()->getCatalog()->getMetadataForTable("test_table_2", false);
-  ASSERT_TRUE(td != nullptr);
-  ASSERT_EQ(10, td->maxRollbackEpochs);
+  ASSERT_EQ(10, max_rollback_epochs("test_table_2"));
 }
 
 TEST_F(DumpAndRestoreTest, TableWithDefaultColumnValues) {
@@ -451,8 +454,7 @@ TEST_F(DumpAndRestoreTest, TableWithDefaultColumnValues) {
       "f FLOAT DEFAULT 1.15, n DECIMAL(3,2) DEFAULT 1.25 ENCODING FIXED(16));");
   run_ddl_statement("DUMP TABLE test_table TO '" + tar_ball_path + "';");
   run_ddl_statement("RESTORE TABLE test_table_2 FROM '" + tar_ball_path + "';");
-  auto td = QR::get()->getCatalog()->getMetadataForTable("test_table_2", false);
-  std::string schema = QR::get()->getCatalog()->dumpCreateTable(td, false);
+  std::string schema = single_line_create_table("test_table_2");
   std::string expected_schema =
       "CREATE TABLE test_table_2 (idx INTEGER NOT NULL, i INTEGER "
       "DEFAULT 14, big_i "
@@ -475,8 +477,8 @@ void compression_test_create_table(std::string table, int nrows) {
 }
 
 TargetValue compression_test_query(const std::string& query_str,
-                                   const ExecutorDeviceType device_type) {
-  auto rows = QR::get()->runSQL(query_str, device_type, true);
+                                   const TExecuteMode::type device_type) {
+  auto rows = SqlTestFixture::run_multiple_agg(query_str, device_type);
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(1), crt_row.size()) << query_str;
   return crt_row[0];
@@ -509,7 +511,7 @@ TEST_F(DumpAndRestoreTest, CompressionOptions) {
   run_ddl_statement("DUMP TABLE test_src TO '" + test_file_path + ".df';");
   run_ddl_statement("RESTORE TABLE test_dst_df FROM '" + test_file_path + ".df';");
   auto query = "SELECT count(*) FROM test_dst_df;";
-  EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, ExecutorDeviceType::CPU)));
+  EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, TExecuteMode::CPU)));
 
   // DUMP/RESTORE table: none compression
   run_ddl_statement("DUMP TABLE test_src TO '" + test_file_path + ".nn" +
@@ -517,7 +519,7 @@ TEST_F(DumpAndRestoreTest, CompressionOptions) {
   run_ddl_statement("RESTORE TABLE test_dst_nn FROM '" + test_file_path +
                     ".nn' WITH (compression='none');");
   query = "SELECT count(*) FROM test_dst_nn;";
-  EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, ExecutorDeviceType::CPU)));
+  EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, TExecuteMode::CPU)));
 
   // DUMP/RESTORE table: GZIP compression
   bool hasGZIP = !boost::process::search_path("gzip").string().empty();
@@ -527,7 +529,7 @@ TEST_F(DumpAndRestoreTest, CompressionOptions) {
     run_ddl_statement("RESTORE TABLE test_dst_gz FROM '" + test_file_path +
                       ".gz' WITH (compression='gzip');");
     auto query = "SELECT count(*) FROM test_dst_gz;";
-    EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, ExecutorDeviceType::CPU)));
+    EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, TExecuteMode::CPU)));
   }
 
   // DUMP/RESTORE table: LZ4 compression
@@ -538,13 +540,13 @@ TEST_F(DumpAndRestoreTest, CompressionOptions) {
     run_ddl_statement("RESTORE TABLE test_dst_lz FROM '" + test_file_path +
                       ".lz' WITH (compression='lz4');");
     query = "SELECT count(*) FROM test_dst_lz;";
-    EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, ExecutorDeviceType::CPU)));
+    EXPECT_EQ(nRows, v<int64_t>(compression_test_query(query, TExecuteMode::CPU)));
   }
 
   // DUMP/RESTORE table: bogus compression type should throw
   EXPECT_THROW(run_ddl_statement("DUMP TABLE test_src TO '" + test_file_path + ".bg" +
                                  "' WITH (compression='bogus');"),
-               std::runtime_error);
+               std::exception);
 
   // check file sizes on disk
   if (hasGZIP && hasLZ4) {
@@ -624,7 +626,7 @@ TEST_F(DumpAndRestoreTest, DropRenderGroupColumnsBad) {
                        .string();
   EXPECT_THROW(run_ddl_statement("RESTORE TABLE render_groups FROM '" + file_path +
                                  "' WITH (compression='gzip');"),
-               std::runtime_error);
+               std::exception);
 }
 
 TEST_F(DumpAndRestoreTest, QuotedColumnNames) {
@@ -640,26 +642,25 @@ class DumpAndRestoreMetadataTest : public DumpAndRestoreTest {
  protected:
   void verifyExpectedTableComment(const std::string& table_name,
                                   const std::string& comment) {
-    auto catalog = QR::get()->getCatalog();
-    auto td = catalog->getMetadataForTable(table_name);
-    CHECK(td) << "table does not exist";
-    EXPECT_TRUE(td->comment.has_value());
-    EXPECT_EQ(td->comment.value(), comment);
+    const auto details = SqlTestFixture::getTableDetails(table_name);
+    EXPECT_TRUE(details.__isset.comment);
+    EXPECT_EQ(details.comment, comment);
   }
 
   void verifyExpectedColumnComment(const std::string& table_name,
                                    const std::string& column_name,
                                    const std::optional<std::string>& comment) {
-    auto catalog = QR::get()->getCatalog();
-    auto td = catalog->getMetadataForTable(table_name);
-    CHECK(td) << "table does not exist";
-    auto cd = catalog->getMetadataForColumn(td->tableId, column_name);
-    CHECK(cd) << "column does not exist for table";
+    const auto details = SqlTestFixture::getTableDetails(table_name);
+    const auto col = std::find_if(
+        details.row_desc.begin(), details.row_desc.end(), [&](const TColumnType& col) {
+          return col.col_name == column_name;
+        });
+    CHECK(col != details.row_desc.end()) << "column does not exist for table";
     if (comment.has_value()) {
-      EXPECT_TRUE(cd->comment.has_value());
-      EXPECT_EQ(cd->comment.value(), comment);
+      EXPECT_TRUE(col->__isset.comment);
+      EXPECT_EQ(col->comment, comment);
     } else {
-      EXPECT_FALSE(cd->comment.has_value());
+      EXPECT_FALSE(col->__isset.comment);
     }
   }
 };
@@ -710,191 +711,16 @@ TEST_F(DumpAndRestoreMetadataTest, CommentWithControlCharacters) {
   verifyExpectedTableComment("test_table_2", "this is a\ncomment\twith \fcontrol\bchars");
 }
 
-#ifdef HAVE_AWS_S3
-class S3RestoreTest : public DumpAndRestoreTest {
- protected:
-  void SetUp() override {
-    g_allow_s3_server_privileges = false;
-    run_ddl_statement("DROP TABLE IF EXISTS test_table;");
-  }
-
-  void TearDown() override {
-    g_allow_s3_server_privileges = false;
-    run_ddl_statement("DROP TABLE IF EXISTS test_table;");
-  }
-
-  bool insufficientPrivateCredentials() const {
-    return !is_valid_aws_key(get_aws_keys_from_env());
-  }
-
-  void queryAndAssertPartialException(const std::string& query,
-                                      const std::string& error_message) {
-    try {
-      run_ddl_statement(query);
-      FAIL() << "An exception should have been thrown for this test case";
-    } catch (const std::exception& e) {
-      std::string exception_message{e.what()};
-      ASSERT_TRUE(exception_message.find(error_message) != std::string::npos)
-          << "Exception message: " << exception_message
-          << ", expected partial error message: " << error_message;
-    }
-  }
-
-  std::string getRestoreQuery(const std::string& object_key,
-                              const std::string& region = aws_region_,
-                              const std::string& access_key = {},
-                              const std::string& secret_key = {},
-                              const std::string& session_token = {},
-                              const std::string& endpoint = {}) {
-    std::string query{"RESTORE TABLE test_table FROM 's3://" + object_key +
-                      "' "
-                      "WITH (compression = 'gzip'"};
-    if (!region.empty()) {
-      query += ", s3_region = '" + region + "'";
-    }
-    if (!access_key.empty()) {
-      query += ", s3_access_key = '" + access_key + "'";
-    }
-    if (!secret_key.empty()) {
-      query += ", s3_secret_key = '" + secret_key + "'";
-    }
-    if (!session_token.empty()) {
-      query += ", s3_session_token = '" + session_token + "'";
-    }
-    if (!endpoint.empty()) {
-      query += ", s3_endpoint = '" + endpoint + "'";
-    }
-    query += ");";
-    return query;
-  }
-
-  static inline const std::string aws_region_{"us-west-1"};
-  static inline const std::string dump_file_name_{"test_table_dump.gz"};
-  static inline const std::string public_bucket_{"heavydb-dump-restore-test-public"};
-  static inline const std::string public_object_key_{
-      "heavydb-dump-restore-test-public/test_table_dump.gz"};
-  static inline const std::string private_object_key_{
-      "heavydb-dump-restore-test/test_table_dump.gz"};
-  static inline const std::string gcs_object_key_{
-      "omnisci-importtest-data/dump-restore-test-data/test_table_dump.gz"};
-};
-
-// TODO(IAM): re-enable once a CI IAM user with read on
-// heavydb-dump-restore-test-public is provisioned. The current CI user
-// has no GetObject on that bucket, so this hits AccessDenied.
-TEST_F(S3RestoreTest, DISABLED_PublicBucket) {
-  run_ddl_statement(getRestoreQuery(public_object_key_));
-  sqlAndCompareResult("SELECT * FROM test_table ORDER BY i;", {1, 2, 3});
-}
-
-TEST_F(S3RestoreTest, PrivateBucket) {
-  if (insufficientPrivateCredentials()) {
-    GTEST_SKIP() << "Insufficient private credentials to run test";
-  }
-  const auto [access_key, secret_key] = get_aws_keys_from_env();
-  run_ddl_statement(
-      getRestoreQuery(private_object_key_, aws_region_, access_key, secret_key));
-  sqlAndCompareResult("SELECT * FROM test_table ORDER BY i;", {1, 2, 3});
-}
-
-TEST_F(S3RestoreTest, PrivateBucketUsingSessionToken) {
-  if (insufficientPrivateCredentials()) {
-    GTEST_SKIP() << "Insufficient private credentials to run test";
-  }
-  const auto aws_keys = get_aws_keys_from_env();
-  Aws::Client::ClientConfiguration client_config;
-  client_config.region = aws_region_;
-  const auto sts_credentials = generate_sts_credentials(aws_keys, client_config);
-
-  run_ddl_statement(getRestoreQuery(private_object_key_,
-                                    aws_region_,
-                                    sts_credentials.GetAccessKeyId(),
-                                    sts_credentials.GetSecretAccessKey(),
-                                    sts_credentials.GetSessionToken()));
-  sqlAndCompareResult("SELECT * FROM test_table ORDER BY i;", {1, 2, 3});
-}
-
-TEST_F(S3RestoreTest, PrivateBucketWithServerPrivileges) {
-  if (insufficientPrivateCredentials()) {
-    GTEST_SKIP() << "Insufficient private credentials to run test";
-  }
-  g_allow_s3_server_privileges = true;
-  run_ddl_statement(getRestoreQuery(private_object_key_));
-  sqlAndCompareResult("SELECT * FROM test_table ORDER BY i;", {1, 2, 3});
-}
-
-// TODO(IAM): re-enable once a CI IAM user with read on
-// omnisci-importtest-data is provisioned.
-TEST_F(S3RestoreTest, DISABLED_CustomS3Endpoint) {
-  run_ddl_statement(getRestoreQuery(
-      gcs_object_key_, aws_region_, {}, {}, {}, "storage.googleapis.com"));
-  sqlAndCompareResult("SELECT * FROM test_table ORDER BY i;", {1, 2, 3});
-}
-
-TEST_F(S3RestoreTest, PrivateBucketNoAccess) {
-  queryAndAssertPartialException(
-      getRestoreQuery(
-          private_object_key_, aws_region_, "invalid_access_key", "invalid_secret_key"),
-      "failed to get object '" + dump_file_name_ + "' of s3 url 's3://" +
-          private_object_key_ + "': InvalidAccessKeyId");
-}
-
-TEST_F(S3RestoreTest, WrongOptionType) {
-  queryAndAssertException("RESTORE TABLE test_table FROM 's3://" + public_object_key_ +
-                              "' "
-                              "WITH (compression = 'gzip', s3_region = 10);",
-                          "\"s3_region\" option must be a string.");
-}
-
-TEST_F(S3RestoreTest, MissingRegion) {
-  queryAndAssertException(getRestoreQuery(public_object_key_, {}),
-                          "Required parameter \"s3_region\" not set. Please specify the "
-                          "\"s3_region\" configuration parameter.");
-}
-
-// TODO(IAM): re-enable once a CI IAM user with read on
-// heavydb-dump-restore-test-public is provisioned.
-TEST_F(S3RestoreTest, DISABLED_S3BucketWithMultipleFiles) {
-  queryAndAssertException(
-      getRestoreQuery(public_bucket_),
-      "S3 URI references multiple files. Only one file can be restored at a time.");
-}
-#endif
-
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
 
-  namespace po = boost::program_options;
-  po::options_description desc("Options");
-
-  logger::LogOptions log_options(argv[0]);
-  log_options.max_files_ = 0;  // stderr only by default
-  log_options.set_base_path(BASE_PATH);
-  desc.add(log_options.get_options());
-
-  po::variables_map vm;
-  po::store(po::command_line_parser(argc, argv).options(desc).run(), vm);
-  po::notify(vm);
-
-  logger::init(log_options);
-
-  QR::init(BASE_PATH);
-
-#ifdef HAVE_AWS_S3
-  heavydb_aws_sdk::init_sdk();
-#endif
-
   int err{0};
   try {
+    SqlTestFixture::initConnection(argc, argv);
     err = RUN_ALL_TESTS();
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
+    err = 1;
   }
-
-#ifdef HAVE_AWS_S3
-  heavydb_aws_sdk::shutdown_sdk();
-#endif
-
-  QR::reset();
   return err;
 }

@@ -169,17 +169,29 @@ add_thin_client_test_variant(AlterSystemTest cpu_only
 
 ##########
 
-add_executable(AlterTableDdlTest AlterTableDdlTest.cpp)
-target_link_libraries(AlterTableDdlTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-add_test(AlterTableDdlTest AlterTableDdlTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS AlterTableDdlTest)
+# The in-process main() also initialised a QueryRunner, so queries ran with loop joins
+# allowed and without view optimization. Drop_columns_rollback set g_test_drop_column_rollback
+# in process, so it runs against a server started with --test-drop-column-rollback (the
+# default entry excludes it); the filters must stay in sync with AlterTableDdlTest.cpp.
+add_thin_client_test(AlterTableDdlTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-AlterColumnTest4.Drop_columns_rollback")
+add_thin_client_test_variant(AlterTableDdlTest drop_column_rollback
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --test-drop-column-rollback
+  GTEST_FILTER "AlterColumnTest4.Drop_columns_rollback")
 
 ##########
 
-add_executable(ArrayTest ArrayTest.cpp)
-target_link_libraries(ArrayTest ${EXECUTE_TEST_LIBS})
-add_test(ArrayTest ArrayTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS ArrayTest)
+# The in-process tests ran queries with loop joins allowed (QueryRunner::runSQL). The
+# parallel-linearization tests lowered g_enable_parallel_linearization to 10 in process, so
+# they run against a server started with that threshold (the default entry excludes them);
+# the filters must stay in sync with MultiFragArrayParallelLinearizationTest in ArrayTest.cpp.
+add_thin_client_test(ArrayTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-MultiFragArrayParallelLinearizationTest.*")
+add_thin_client_test_variant(ArrayTest parallel_linearization
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --enable-parallel-linearization=10
+  GTEST_FILTER "MultiFragArrayParallelLinearizationTest.*")
 
 ##########
 
@@ -296,10 +308,7 @@ add_thin_client_test(CrossDatabaseQueryTest)
 
 ##########
 
-add_executable(CtasUpdateTest CtasUpdateTest.cpp)
-target_link_libraries(CtasUpdateTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-add_test(CtasUpdateTest CtasUpdateTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS CtasUpdateTest)
+add_thin_client_test(CtasUpdateTest)
 
 ##########
 
@@ -363,10 +372,23 @@ list(APPEND SANITY_TEST_PROGRAMS DiskCacheQueryTest)
 
 ##########
 
-add_executable(DumpRestoreTest DumpRestoreTest.cpp)
-target_link_libraries(DumpRestoreTest ${EXECUTE_TEST_LIBS})
-add_test(DumpRestoreTest DumpRestoreTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS DumpRestoreTest)
+# The in-process tests ran QueryRunner queries with loop joins allowed and without view
+# optimization. The migrate-with-rollback tests set g_test_rollback_dump_restore in process,
+# so they run against a server started with --test-rollback-dump-restore (the default entry
+# excludes them); the filters must stay in sync with DumpRestoreTest.cpp.
+add_thin_client_test(DumpRestoreTest
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false
+  GTEST_FILTER "-*DumpMigrate_Rollback*:*DumpMigrate_Altered_Rollback*")
+add_thin_client_test_variant(DumpRestoreTest rollback
+  SERVER_FLAGS --allow-loop-joins=true --enable-calcite-view-optimize=false --test-rollback-dump-restore
+  GTEST_FILTER "*DumpMigrate_Rollback*:*DumpMigrate_Altered_Rollback*")
+
+# Split out of DumpRestoreTest: needs the test-only Catalog::setUncappedTableEpoch() and the
+# AWS SDK in the test process, so it keeps the in-process fixture.
+add_executable(DumpRestoreInternalsTest DumpRestoreInternalsTest.cpp)
+target_link_libraries(DumpRestoreInternalsTest ${EXECUTE_TEST_LIBS})
+add_test(DumpRestoreInternalsTest DumpRestoreInternalsTest ${TEST_ARGS})
+list(APPEND SANITY_TEST_PROGRAMS DumpRestoreInternalsTest)
 
 ##########
 
@@ -839,10 +861,24 @@ list(APPEND SANITY_TESTS StringDictionaryHashTest)
 
 ##########
 
-add_executable(StringFunctionsTest StringFunctionsTest.cpp)
-target_link_libraries(StringFunctionsTest ${THRIFT_HANDLER_TEST_LIBRARIES})
-add_test(StringFunctionsTest StringFunctionsTest ${TEST_ARGS})
-list(APPEND SANITY_TEST_PROGRAMS StringFunctionsTest)
+# The in-process main() ran with g_enable_watchdog = true. Four tests changed a server global
+# in process, so each runs against a server started with that setting instead (the default
+# entry excludes them); the filters must stay in sync with the list in StringFunctionsTest.cpp.
+add_thin_client_test(StringFunctionsTest
+  SERVER_FLAGS --enable-watchdog=true
+  GTEST_FILTER "-*SelectLowercase_StringFunctionsDisabled*:*SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit*:*LLMTransformCurlError*:*LLMTransformNDVWatchdogLimit*")
+add_thin_client_test_variant(StringFunctionsTest string_functions_disabled
+  SERVER_FLAGS --enable-watchdog=true --enable-string-functions=false
+  GTEST_FILTER "*SelectLowercase_StringFunctionsDisabled*")
+add_thin_client_test_variant(StringFunctionsTest watchdog_limit
+  SERVER_FLAGS --enable-watchdog=true --watchdog-none-encoded-string-translation-limit=3
+  GTEST_FILTER "*SelectLowercaseNoneEncoded_MoreRowsThanWatchdogLimit*")
+add_thin_client_test_variant(StringFunctionsTest llm_curl_error
+  SERVER_FLAGS --enable-watchdog=true --iq-url=http://localhost:99999
+  GTEST_FILTER "*LLMTransformCurlError*")
+add_thin_client_test_variant(StringFunctionsTest llm_ndv_limit
+  SERVER_FLAGS --enable-watchdog=true --llm-transform-max-num-unique-value=1
+  GTEST_FILTER "*LLMTransformNDVWatchdogLimit*")
 
 ##########
 

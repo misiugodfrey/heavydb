@@ -257,6 +257,8 @@ extern size_t g_max_import_threads;
 extern bool g_disable_cpu_mem_pool_import_buffers;
 extern bool g_enable_auto_metadata_update;
 extern bool g_allow_s3_server_privileges;
+extern bool g_test_rollback_dump_restore;
+extern bool g_test_drop_column_rollback;
 extern bool g_allow_s3_imds_check;
 extern float g_vacuum_min_selectivity;
 extern bool g_read_only;

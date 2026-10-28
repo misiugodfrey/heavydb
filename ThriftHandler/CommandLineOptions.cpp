@@ -966,6 +966,23 @@ void CommandLineOptions::fillDeveloperOptions() {
   po::options_description& desc = developer_desc_;
 
   desc.add_options()("dev-options", "Print internal developer options.");
+  desc.add_options()("test-rollback-dump-restore",
+                     po::value<bool>(&g_test_rollback_dump_restore)
+                         ->default_value(g_test_rollback_dump_restore)
+                         ->implicit_value(true),
+                     "For testing only: make RESTORE TABLE fail after it has created "
+                     "the table, to test its rollback.");
+  desc.add_options()("test-drop-column-rollback",
+                     po::value<bool>(&g_test_drop_column_rollback)
+                         ->default_value(g_test_drop_column_rollback)
+                         ->implicit_value(true),
+                     "For testing only: make ALTER TABLE DROP COLUMN fail part way, to "
+                     "test its rollback.");
+  desc.add_options()("enable-parallel-linearization",
+                     po::value<size_t>(&g_enable_parallel_linearization)
+                         ->default_value(g_enable_parallel_linearization),
+                     "Minimum number of rows in a chunk for which varlen columns are "
+                     "linearized in parallel.");
 #ifdef HAVE_RENDERING
   desc.add_options()(
       "render-compositor-use-last-gpu",
